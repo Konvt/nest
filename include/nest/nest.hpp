@@ -1785,17 +1785,21 @@ namespace nest {
     // Please pay attention to the ODR-use issue when defining the macro NEST_DEBUG.
 #ifdef NEST_DEBUG
     /// @brief This method is intended SOLELY for DEBUG purposes and SHOULD NOT APPEAR IN NORMAL CODE.
-    ///        Element format: `["string"]` (has data) or `{count;prev,next}` (just hole)
+    ///        Element format: `["string"]` (has data) or `{count;prev.next}` (just hole)
     ///        Skip format:    `[0;length]` (repeated), `0`, `1` (separately)
     ///                        or `{length;...;length}` (just hole)
     template<typename OutputIter>
     [[nodiscard]] OutputIter _dump_to( OutputIter oiter ) const
     { // DEBUG ONLY
+      if ( head_ == nullptr )
+        return std::format_to( oiter, "<empty> (capacity={})", capacity_ );
+
+      oiter        = std::format_to( oiter, "Hive (capacity={}, occupied={}):\n", capacity_, occupied_ );
       size_type id = 0;
       auto block   = head_;
       while ( true ) {
         oiter = std::format_to( oiter,
-                                "Block #{}  [capacity={}, occupied={}",
+                                "- Block #{}   [capacity={}, occupied={}",
                                 id++,
                                 block->capacity,
                                 block->occupied );
@@ -1804,7 +1808,7 @@ namespace nest {
         else
           *( oiter++ ) = ']';
 
-        oiter          = std::ranges::copy( "\n Element: ", oiter ).out;
+        oiter          = std::ranges::copy( "\n    Element: ", oiter ).out;
         auto element   = block->element;
         auto skipfield = block->skipfield;
         while ( true ) {
@@ -1814,13 +1818,13 @@ namespace nest {
             oiter            = std::format_to( oiter, "{{{};", as_skipfield( skipfield ) );
             if ( index.prev == index.next ) {
               assert( index.prev == Index::npos );
-              oiter = std::ranges::copy( "#,#", oiter ).out;
+              oiter = std::ranges::copy( "#.#", oiter ).out;
             } else if ( index.prev == Index::npos )
-              oiter = std::format_to( oiter, "#,{}", as_index( element ).next );
+              oiter = std::format_to( oiter, "#.{}", as_index( element ).next );
             else if ( index.next == Index::npos )
-              oiter = std::format_to( oiter, "{},#", as_index( element ).prev );
+              oiter = std::format_to( oiter, "{}.#", as_index( element ).prev );
             else
-              oiter = std::format_to( oiter, "{},{}", as_index( element ).prev, as_index( element ).next );
+              oiter = std::format_to( oiter, "{}.{}", as_index( element ).prev, as_index( element ).next );
             *( oiter++ ) = '}';
             element      = address_at<Payload>( element, 1 );
             skipfield    = address_at<Skipfield>( skipfield, as_skipfield( skipfield ) );
@@ -1835,7 +1839,7 @@ namespace nest {
             break;
         }
 
-        oiter                     = std::ranges::copy( "\n  Skip:    ", oiter ).out;
+        oiter                     = std::ranges::copy( "\n    Skip:    ", oiter ).out;
         skipfield                 = block->skipfield;
         Skipfield continuous_zero = 0;
         while ( true ) {
@@ -1942,11 +1946,13 @@ namespace nest {
     {
       assert( block != nullptr );
       if ( list != nullptr ) {
-        block->next = list;
         block->prev = list->prev;
+        block->next = list;
         list->prev  = block;
-      } else
+      } else {
         block->prev = block;
+        block->next = nullptr;
+      }
       list = block;
     }
     // Take a block from the head of list, this function will not change the hollow pointer.
