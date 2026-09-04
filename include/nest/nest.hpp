@@ -1,3 +1,6 @@
+// This code is licensed under the MIT License.
+// Please see the LICENSE file in the root of the repository for the full license text.
+// Copyright (c) 2026 Konvt
 #ifndef NEST_HIVE_HPP
 #define NEST_HIVE_HPP
 
@@ -169,7 +172,7 @@ namespace nest {
 
       template<typename Act, typename Fin>
       NEST_FORCEINLINE constexpr decltype( auto ) ensure( Act&& action, Fin&& finally )
-      { // we do not call `attempt` here because the reason is the same as above.
+      {
         struct AtExit {
           Fin& fin;
           constexpr ~AtExit() noexcept( std::is_nothrow_invocable_v<Fin> )
