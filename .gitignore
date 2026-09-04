@@ -1,0 +1,6 @@
+vscode/
+build/
+misc/
+
+test*
+*.exe
