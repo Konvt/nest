@@ -314,9 +314,6 @@ namespace nest {
         {
           static_assert( std::is_same_v<value_type, typename std::allocator_traits<Alloc>::value_type> );
           using UnitPointer = std::allocator_traits<Alloc>::pointer;
-          if constexpr ( !std::is_pointer_v<UnitPointer> )
-            // to satisfy the requirement of pointer_cast
-            std::construct_at( pointer_cast<value_type*>( ptr ) );
           std::allocator_traits<Alloc>::deallocate( alloc,
                                                     pointer_cast<UnitPointer>( ptr ),
                                                     allocation( scheme ) / sizeof( value_type ) );
