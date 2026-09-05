@@ -734,7 +734,7 @@ namespace nest {
           this->skipfield_ = address_at<Skipfield>( this->skipfield_, 1 );
           return true;
         }
-        remove_hole( this->block_, index_ );
+        pop_hole( this->block_, index_.next );
         if ( index_.next != Index::npos ) {
           this->element_   = address_at<Payload>( this->block_->element, index_.next );
           this->skipfield_ = address_at<Skipfield>( this->block_->skipfield, index_.next );
@@ -758,13 +758,13 @@ namespace nest {
           this->skipfield_ = address_at<Skipfield>( this->skipfield_, step );
           return true;
         }
-        remove_hole( this->block_, index_ );
+        pop_hole( this->block_, index_.next );
         if ( index_.next != Index::npos ) {
           this->element_   = address_at<Payload>( this->block_->element, index_.next );
           this->skipfield_ = address_at<Skipfield>( this->block_->skipfield, index_.next );
           this->rest_      = as_skipfield( this->skipfield_ );
           assert( this->rest_ > 0 );
-          index_ = as_index( address_at<Payload>( this->element_, this->rest_ - 1 ) );
+          index_ = as_index( this->element_ );
           this->element_ -= ( this->rest_ - 1 ) * sizeof( Payload );
           this->skipfield_ -= ( this->rest_ - 1 ) * sizeof( Skipfield );
           return true;
@@ -1410,10 +1410,8 @@ namespace nest {
             if ( source != nullptr )
               extractor = iterator::start_of( source );
           } else {
-            wipe_hole( source, 0, extractor.offset() );
-            source->occupied -= purge( iterator::start_of( source ), extractor );
+            remove( const_iterator::start_of( source ), extractor );
             assert( source->occupied > 0 );
-            add_suffix_hole( source, 0, extractor.offset() );
           }
           if ( target->occupied == target->capacity ) {
             // target is now full, let source be the new target
@@ -1575,11 +1573,8 @@ namespace nest {
           }
           // Similarly, since the transfer process has not been completed,
           // it is certain that the unfitness has not been fully accessed.
-          if ( extractor != iterator::start_of( unfitness ) ) {
-            wipe_hole( unfitness, 0, extractor.offset() );
-            unfitness->occupied -= purge( iterator::start_of( unfitness ), extractor );
-            add_suffix_hole( unfitness, 0, extractor.offset() );
-          }
+          if ( extractor != iterator::start_of( unfitness ) )
+            remove( const_iterator::start_of( unfitness ), extractor );
 
           do {
             if ( unfitness->occupied < unfitness->capacity )
@@ -1679,7 +1674,7 @@ namespace nest {
             }
             // The `first` is valid, therefore,
             // there will definitely be no forward merger opportunity for the new hole.
-            add_suffix_hole( iter.block_, iter.offset(), length );
+            add_prefix_hole( iter.block_, iter.offset(), length );
             if ( full )
               add_hollow( hollow_, first.block_ );
             assert( last.block_->occupied > 0 );
@@ -1696,9 +1691,7 @@ namespace nest {
           } else {
             // remove prefix
             assert( repetitive == false );
-            wipe_hole( last.block_, 0, last.offset() );
-            last.block_->occupied -= purge( iterator::start_of( last.block_ ), last );
-            add_suffix_hole( last.block_, 0, last.offset() );
+            remove( const_iterator::start_of( last.block_ ), last );
             assert( last.block_->occupied > 0 );
             if ( full )
               add_hollow( hollow_, first.block_ );
@@ -1846,7 +1839,7 @@ namespace nest {
           if ( as_skipfield( skipfield ) > 0 ) {
             if ( continuous_zero > 1 )
               oiter = std::format_to( oiter, "[0;{}], ", continuous_zero );
-            else
+            else if ( continuous_zero > 0 )
               oiter = std::ranges::copy( "0, ", oiter ).out;
             continuous_zero = 0;
             if ( as_skipfield( skipfield ) > 1 )
@@ -2066,6 +2059,14 @@ namespace nest {
       return nullptr;
     }
 
+    // Pop the first hole.
+    NEST_FORCEINLINE static void pop_hole( Unit block, Skipfield next_hole ) noexcept
+    {
+      assert( block->first_hole != Index::npos );
+      block->first_hole = next_hole;
+      if ( next_hole != Index::npos )
+        index_at( block, next_hole ).prev = Index::npos;
+    }
     NEST_FORCEINLINE static void remove_hole( Unit block, Index index ) noexcept
     {
       assert( block->first_hole != Index::npos );
@@ -2076,6 +2077,7 @@ namespace nest {
       if ( index.next != Index::npos )
         index_at( block, index.next ).prev = index.prev;
     }
+
     /// @brief Fix the length information of the hole
     /// @param length The new length.
     NEST_FORCEINLINE static void fix_hole( Area first, Skipfield length ) noexcept
@@ -2102,7 +2104,7 @@ namespace nest {
       assert( pos + length - 1 != Index::npos );
       if ( block->first_hole != Index::npos ) {
         // Pointers that are out of range but will not be dereferenced are safe.
-        const auto prev_neighbor = address_at<Skipfield>( block->skipfield, pos - 1 );
+        const auto prev_neighbor = address_at<Skipfield>( block->skipfield, pos - 1u );
         // Note that allocate allocates an extra element at the end of the Skipfield array,
         // so dereferencing this pointer is always safe.
         const auto next_neighbor = address_at<Skipfield>( block->skipfield, pos + length );
@@ -2135,8 +2137,7 @@ namespace nest {
               as_skipfield( next_neighbor ) + length;
         } else {
           // create a new hole
-          as_skipfield( prev_neighbor + sizeof( Skipfield ) ) =
-            as_skipfield( next_neighbor - sizeof( Skipfield ) ) = length;
+          skipfield_at( block, pos ) = skipfield_at( block, pos + length - 1 ) = length;
           std::construct_at( as_address<Payload>( block->element, pos + length - 1 ),
                              Index { Index::npos, block->first_hole } );
           index_at( block, block->first_hole ).prev = pos + length - 1;
@@ -2146,11 +2147,11 @@ namespace nest {
         build_hole( block, pos, length );
     }
     /// @brief Add a new hole that does not have any backward holes.
-    NEST_FORCEINLINE static void add_prefix_hole( Unit block, Skipfield pos, Skipfield length ) noexcept
+    NEST_FORCEINLINE static void add_suffix_hole( Unit block, Skipfield pos, Skipfield length ) noexcept
     {
       assert( pos + length - 1 != Index::npos );
       if ( block->first_hole != Index::npos ) {
-        const auto prev_neighbor = address_at<Skipfield>( block->skipfield, pos - 1 );
+        const auto prev_neighbor = address_at<Skipfield>( block->skipfield, pos - 1u );
         if ( pos > 0 && as_skipfield( prev_neighbor ) > 0 ) {
           // merge left
           skipfield_at( block, pos - as_skipfield( prev_neighbor ) ) =
@@ -2168,8 +2169,7 @@ namespace nest {
             index_at( block, index.next ).prev = pos + length - 1;
         } else {
           // create a new hole
-          as_skipfield( prev_neighbor + sizeof( Skipfield ) ) = skipfield_at( block, pos + length - 1 ) =
-            length;
+          skipfield_at( block, pos ) = skipfield_at( block, pos + length - 1 ) = length;
           std::construct_at( as_address<Payload>( block->element, pos + length - 1 ),
                              Index { Index::npos, block->first_hole } );
           index_at( block, block->first_hole ).prev = pos + length - 1;
@@ -2179,7 +2179,7 @@ namespace nest {
         build_hole( block, pos, length );
     }
     /// @brief Add a new hole that does not have any forward holes.
-    NEST_FORCEINLINE static void add_suffix_hole( Unit block, Skipfield pos, Skipfield length ) noexcept
+    NEST_FORCEINLINE static void add_prefix_hole( Unit block, Skipfield pos, Skipfield length ) noexcept
     {
       assert( pos + length - 1 != Index::npos );
       if ( block->first_hole != Index::npos ) {
@@ -2191,7 +2191,7 @@ namespace nest {
               as_skipfield( next_neighbor ) + length;
         } else {
           // create a new hole
-          skipfield_at( block, pos ) = as_skipfield( next_neighbor - sizeof( Skipfield ) ) = length;
+          skipfield_at( block, pos ) = skipfield_at( block, pos + length - 1 ) = length;
           std::construct_at( as_address<Payload>( block->element, pos + length - 1 ),
                              Index { Index::npos, block->first_hole } );
           index_at( block, block->first_hole ).prev = pos + length - 1;
@@ -2379,31 +2379,6 @@ namespace nest {
       return num_dropped;
     }
 
-    // Wipe the holes between [first, last).
-    void wipe_hole( Unit block, Skipfield first, Skipfield last ) noexcept
-    {
-      assert( block != nullptr );
-      assert( first != Index::npos );
-      assert( last != Index::npos );
-      assert( first < last );
-      assert( last <= block->capacity );
-      if ( block->first_hole == Index::npos )
-        return;
-      auto element        = address_at<Payload>( block->element, first );
-      auto skipfield      = address_at<Skipfield>( block->skipfield, first );
-      const auto terminus = address_at<Skipfield>( block->skipfield, last );
-      do {
-        if ( as_skipfield( skipfield ) > 0 ) {
-          remove_hole( block, as_index( element ) );
-          element   = address_at<Payload>( element, as_skipfield( skipfield ) );
-          skipfield = address_at<Skipfield>( skipfield, as_skipfield( skipfield ) );
-        } else {
-          element   = address_at<Payload>( element, 1 );
-          skipfield = address_at<Skipfield>( skipfield, 1 );
-        }
-      } while ( skipfield < terminus );
-    }
-
     // Destroy all elements on the block starting from `first` itself.
     // This function will remove the hole when iterating, but will not recover the hole info.
     Skipfield wipe( const_iterator first ) noexcept
@@ -2464,7 +2439,7 @@ namespace nest {
       if ( first.block_->occupied > 0 )
         // `wipe` deletes all holes accessed during traversal, including the last one;
         // therefore, clearly, no valid hole exists after first once `wipe` has been executed
-        add_prefix_hole( first.block_, first.offset(), first.block_->capacity - first.offset() );
+        add_suffix_hole( first.block_, first.offset(), first.block_->capacity - first.offset() );
       else
         first.block_->first_hole = Index::npos;
       return num_deleted;
@@ -2475,7 +2450,7 @@ namespace nest {
     {
       const auto num_deleted = wipe( first, last );
       if ( first.block_->occupied > 0 )
-        add_prefix_hole( first.block_, first.offset(), last.offset() - first.offset() );
+        add_suffix_hole( first.block_, first.offset(), last.offset() - first.offset() );
       else
         first.block_->first_hole = Index::npos;
       return num_deleted;
