@@ -312,9 +312,9 @@ namespace nest {
         static constexpr void deallocate( Alloc& alloc, auto ptr, scheme_type scheme ) noexcept
         {
           static_assert( std::is_same_v<value_type, typename std::allocator_traits<Alloc>::value_type> );
-          using UnitPointer = std::allocator_traits<Alloc>::pointer;
+          using Resource = std::allocator_traits<Alloc>::pointer;
           std::allocator_traits<Alloc>::deallocate( alloc,
-                                                    pointer_cast<UnitPointer>( ptr ),
+                                                    pointer_cast<Resource>( ptr ),
                                                     allocation( scheme ) / sizeof( value_type ) );
         }
 
@@ -344,12 +344,9 @@ namespace nest {
         static constexpr void deallocate( Alloc& alloc, auto ptr, size_type count ) noexcept
         {
           static_assert( std::is_same_v<value_type, typename std::allocator_traits<Alloc>::value_type> );
-          using UnitPointer = std::allocator_traits<Alloc>::pointer;
-          if constexpr ( !std::is_pointer_v<UnitPointer> )
-            // to satisfy the requirement of pointer_cast
-            std::construct_at( pointer_cast<value_type*>( ptr ) );
+          using Resource = std::allocator_traits<Alloc>::pointer;
           std::allocator_traits<Alloc>::deallocate( alloc,
-                                                    pointer_cast<UnitPointer>( ptr ),
+                                                    pointer_cast<Resource>( ptr ),
                                                     allocation( count ) / sizeof( value_type ) );
         }
       };
@@ -412,15 +409,43 @@ namespace nest {
     using AreaAlloc = Layout::template rebind_alloc<Alloc>;
     using Area =
       std::pointer_traits<typename std::allocator_traits<AreaAlloc>::pointer>::template rebind<std::byte>;
+    /// NOTE:
+    /// The standard library is very weak in handling type conversions for fancy pointers.
+    /// If we need strict support for all user-provided allocators while preserving
+    /// the validity of fancy pointers,
+    /// we must give up constexpr execution capability (due to pointer reinterpretation involved).
+
+    /// Specifically, for performance reasons, we adopted a SoA layout that allocates
+    /// Payload and Skipfield together.
+    /// This structure requires us to allocate an entire array aligned to the maximum alignment
+    /// of T and Skipfield,
+    /// then split it at corresponding offsets to obtain the starting address of the target array.
+
+    /// However, if the allocator returns a pointer that is not a plain pointer type,
+    /// there will be issues with pointer type conversion during memory block splitting.
+    /// In such cases, the only valid way to perform pointer conversion is via pointer_traits::pointer_to,
+    /// but this function requires a T& argument rather than a T*.
+    /// Clearly, we cannot obtain a valid T& before constructing an object
+    /// (which would violate lifetime constraints),
+    /// effectively preventing us from holding separate fancy pointers to Payload and Skipfield.
+
+    /// The current implementation uses an intermediate pointer type (std::byte),
+    /// which satisfies strict aliasing exemption and implicit-lifetime properties,
+    /// allowing us to activate the lifetime of this type even without calling a constructor.
+    /// However, the cost is that we must address memory by bytes,
+    /// and due to unavoidable reinterpretations, we cannot execute operations at compile time.
+
+    /// Even though almost all mainstream implementations of fancy pointers currently
+    /// support construction from raw pointers.
 
     struct Block;
     using BlockAlloc = std::allocator_traits<Alloc>::template rebind_alloc<Block>;
-    using Unit       = std::allocator_traits<BlockAlloc>::pointer;
+    using Chunk      = std::allocator_traits<BlockAlloc>::pointer;
 
     // This type is merely used as a parameter and has no actual meaning.
     struct BiList {
-      Unit head = nullptr;
-      Unit tail = nullptr;
+      Chunk head = nullptr;
+      Chunk tail = nullptr;
     };
 
     // Even if we use a SoALayout calculator, since the alignment of Skipfield is either 1 or 2,
@@ -440,14 +465,14 @@ namespace nest {
 
       // nullptr marks the front of the block chain.
       // This field in the first node will always point to the tail node.
-      Unit prev = nullptr;
+      Chunk prev = nullptr;
       // nullptr marks the end of the block chain.
-      Unit next = nullptr;
+      Chunk next = nullptr;
 
       // nullptr marks the front of the hollow chain.
-      Unit prev_hollow = nullptr;
+      Chunk prev_hollow = nullptr;
       // nullptr marks the end of the hollow chain.
-      Unit next_hollow = nullptr;
+      Chunk next_hollow = nullptr;
     };
 
     NEST_FORCEINLINE static Payload& as_payload( Area ptr ) noexcept
@@ -468,9 +493,9 @@ namespace nest {
       typename std::allocator_traits<AreaAlloc>::difference_type offset ) noexcept
     { return details::utils::pointer_cast<U*>( address_at<U>( origin, offset ) ); }
 
-    NEST_FORCEINLINE static Index& index_at( Unit block, Skipfield pos ) noexcept
+    NEST_FORCEINLINE static Index& index_at( Chunk block, Skipfield pos ) noexcept
     { return as_index( address_at<Payload>( block->element, pos ) ); }
-    NEST_FORCEINLINE static Skipfield& skipfield_at( Unit block, Skipfield pos ) noexcept
+    NEST_FORCEINLINE static Skipfield& skipfield_at( Chunk block, Skipfield pos ) noexcept
     { return as_skipfield( address_at<Skipfield>( block->skipfield, pos ) ); }
 
     static constexpr auto max_default_capacity() noexcept
@@ -495,7 +520,7 @@ namespace nest {
 
       Area element_   = nullptr;
       Area skipfield_ = nullptr;
-      Unit block_     = nullptr;
+      Chunk block_    = nullptr;
 
       // Detect whether the iterator is at the end of the current block.
       NEST_FORCEINLINE constexpr bool exhausted() const noexcept { return element_ >= block_->skipfield; }
@@ -550,7 +575,7 @@ namespace nest {
       // Get the mutable reference of the data.
       NEST_FORCEINLINE Tp& mut() const noexcept { return as_data( element_ ); }
 
-      constexpr Iterator( Area element, Area skipfield, Unit block ) noexcept
+      constexpr Iterator( Area element, Area skipfield, Chunk block ) noexcept
         : element_ { element }, skipfield_ { skipfield }, block_ { block }
       {}
 
@@ -558,13 +583,13 @@ namespace nest {
       NEST_FORCEINLINE static constexpr Iterator from( Iterator<C> other ) noexcept
       { return { other.element_, other.skipfield_, other.block_ }; }
 
-      NEST_FORCEINLINE static Iterator start_of( Unit block ) noexcept
+      NEST_FORCEINLINE static Iterator start_of( Chunk block ) noexcept
       {
         return { address_at<Payload>( block->element, as_skipfield( block->skipfield ) ),
                  address_at<Skipfield>( block->skipfield, as_skipfield( block->skipfield ) ),
                  block };
       }
-      NEST_FORCEINLINE static Iterator sentinel_of( Unit block ) noexcept
+      NEST_FORCEINLINE static Iterator sentinel_of( Chunk block ) noexcept
       { return { block->skipfield, address_at<Skipfield>( block->skipfield, block->capacity ), block }; }
 
     public:
@@ -639,15 +664,15 @@ namespace nest {
     protected:
       Area element_   = nullptr;
       Area skipfield_ = nullptr;
-      Unit block_     = nullptr;
+      Chunk block_    = nullptr;
       Skipfield rest_ = 0; // the rest length of this hole
 
-      constexpr Filler( Area element, Area skipfield, Unit block ) noexcept
+      constexpr Filler( Area element, Area skipfield, Chunk block ) noexcept
         : element_ { element }, skipfield_ { skipfield }, block_ { block }
       {}
 
     public:
-      NEST_FORCEINLINE static constexpr Filler from( Unit blank ) noexcept
+      NEST_FORCEINLINE static constexpr Filler from( Chunk blank ) noexcept
       {
         assert( blank->occupied == 0 );
         Filler cursor { blank->element, blank->skipfield, blank };
@@ -710,7 +735,7 @@ namespace nest {
     public:
       constexpr Muncher() = default;
 
-      NEST_FORCEINLINE static Muncher from( Unit hollow ) noexcept
+      NEST_FORCEINLINE static Muncher from( Chunk hollow ) noexcept
       {
         assert( hollow->occupied < hollow->capacity );
         Muncher cursor { address_at<Payload>( hollow->element, hollow->first_hole ),
@@ -1502,7 +1527,7 @@ namespace nest {
       if ( occupied_ == 0 || capacity_ == 0 )
         return;
 
-      Unit unfitness      = nullptr;
+      Chunk unfitness     = nullptr;
       size_type num_unfit = 0;
       // collect the blocks that does not satisfy the new limit
       for ( auto block = head_->next; block != nullptr; ) {
@@ -1714,7 +1739,7 @@ namespace nest {
         // the element pointed to by the free memory block must meet the alignment requirements of Tp;
         // and if there is such a free block with the size that meets our needs, we will reuse its memory.
         static_assert( alignof( Tp ) <= alignof( Payload ) );
-        Unit borrowed = borrow_from( vacuum_, occupied_ * sizeof( Tp ) );
+        auto borrowed = borrow_from( vacuum_, occupied_ * sizeof( Tp ) );
         if ( borrowed != nullptr )
           direct_sort( details::utils::pointer_cast<Tp*>( borrowed->element ), std::move( comp ) );
         else {
@@ -1725,8 +1750,8 @@ namespace nest {
         }
       } else {
         if constexpr ( alignof( Tp* ) <= Layout::alignment && alignof( size_type ) <= Layout::alignment ) {
-          Unit addresses = borrow_from( vacuum_, occupied_ * sizeof( Tp* ) );
-          Unit mapping   = borrow_from( vacuum_, occupied_ * sizeof( size_type ) );
+          auto addresses = borrow_from( vacuum_, occupied_ * sizeof( Tp* ) );
+          auto mapping   = borrow_from( vacuum_, occupied_ * sizeof( size_type ) );
           if ( mapping != nullptr && mapping == addresses )
             mapping = borrow_from( mapping->next, occupied_ * sizeof( size_type ) );
           if ( addresses != nullptr && mapping != nullptr ) {
@@ -1739,7 +1764,7 @@ namespace nest {
         using BufferLayout = details::utils::SoALayout<Tp*, size_type>;
         if constexpr ( BufferLayout::alignment <= Layout::alignment ) {
           // If we cannot find two small memory blocks but can find one sufficiently large, use it.
-          Unit borrowed = borrow_from( vacuum_, BufferLayout::allocation( occupied_ ) );
+          auto borrowed = borrow_from( vacuum_, BufferLayout::allocation( occupied_ ) );
           if ( borrowed != nullptr ) {
             indirect_sort( details::utils::pointer_cast<Tp**>( borrowed->element ),
                            details::utils::pointer_cast<size_type*>(
@@ -1891,11 +1916,11 @@ namespace nest {
     // member variables:
 
     // `head_` is a bidirectional linked list.
-    Unit head_               = nullptr;
+    Chunk head_              = nullptr;
     // `vacuum_` is a bidirectional linked list.
-    Unit vacuum_             = nullptr;
+    Chunk vacuum_            = nullptr;
     // `hollow_` is a special bidirectional linked list.
-    Unit hollow_             = nullptr;
+    Chunk hollow_            = nullptr;
     size_type occupied_      = 0;
     size_type capacity_      = 0;
     Skipfield max_capacity_  = max_default_capacity();
@@ -1931,7 +1956,7 @@ namespace nest {
     }
 
     // Append a block from to the front of `list`, this function will not change the hollow pointer.
-    NEST_FORCEINLINE static constexpr void attach( Unit& list, Unit block ) noexcept
+    NEST_FORCEINLINE static constexpr void attach( Chunk& list, Chunk block ) noexcept
     {
       assert( block != nullptr );
       if ( list != nullptr ) {
@@ -1945,7 +1970,7 @@ namespace nest {
       list = block;
     }
     // Take a block from the head of list, this function will not change the hollow pointer.
-    NEST_FORCEINLINE static constexpr Unit detach( Unit& list ) noexcept
+    NEST_FORCEINLINE static constexpr Chunk detach( Chunk& list ) noexcept
     {
       assert( list != nullptr );
       auto block = list;
@@ -1957,7 +1982,7 @@ namespace nest {
     }
 
     // Append a block from to the front of `list`, the list cannot be empty.
-    NEST_FORCEINLINE static constexpr void link( Unit& list, Unit block ) noexcept
+    NEST_FORCEINLINE static constexpr void link( Chunk& list, Chunk block ) noexcept
     {
       assert( list != nullptr );
       assert( block != nullptr );
@@ -1968,7 +1993,7 @@ namespace nest {
     }
     // Remove a specified block from its list, the block cannot be the head node of the list.
     // This function will not change the hollow pointer.
-    NEST_FORCEINLINE static constexpr void unlink( Unit& list, Unit& block ) noexcept
+    NEST_FORCEINLINE static constexpr void unlink( Chunk& list, Chunk& block ) noexcept
     {
       assert( list != block );
       assert( block != nullptr );
@@ -1985,7 +2010,7 @@ namespace nest {
 
     // Append the linked list `[front, tail]` to the front of `other`,
     // this function will not change the hollow pointer.
-    static constexpr void concat( Unit& list, Unit other ) noexcept
+    static constexpr void concat( Chunk& list, Chunk other ) noexcept
     {
       assert( other != nullptr );
       assert( other->prev != nullptr );
@@ -1998,7 +2023,7 @@ namespace nest {
     }
 
     // Add a newly hollow block into the hollow linked list.
-    NEST_FORCEINLINE static constexpr void add_hollow( Unit& hollow, Unit& block ) noexcept
+    NEST_FORCEINLINE static constexpr void add_hollow( Chunk& hollow, Chunk& block ) noexcept
     {
       assert( block != nullptr );
       assert( block->occupied < block->capacity );
@@ -2015,7 +2040,7 @@ namespace nest {
         hollow = block;
     }
     // Remove the hollow relation from the list.
-    NEST_FORCEINLINE static constexpr void remove_hollow( Unit& hollow, Unit& block ) noexcept
+    NEST_FORCEINLINE static constexpr void remove_hollow( Chunk& hollow, Chunk& block ) noexcept
     {
       assert( hollow != nullptr );
       assert( block != nullptr );
@@ -2032,7 +2057,7 @@ namespace nest {
       block->prev_hollow = block->next_hollow = nullptr;
     }
     // Splice two hollow chain.
-    static constexpr void splice_hollow( BiList hollow, Unit& other ) noexcept
+    static constexpr void splice_hollow( BiList hollow, Chunk& other ) noexcept
     {
       assert( hollow.head != nullptr );
       assert( hollow.tail != nullptr );
@@ -2045,7 +2070,7 @@ namespace nest {
 
     /// @brief Find a block meet the specified `expected` number of bytes.
     /// @param expected The expected size, in bytes.
-    static constexpr Unit borrow_from( Unit list, size_type expected ) noexcept
+    static constexpr Chunk borrow_from( Chunk list, size_type expected ) noexcept
     {
       for ( ; list != nullptr; list = list->next ) {
         // we don't borrow the last dummy skipfield
@@ -2056,14 +2081,14 @@ namespace nest {
     }
 
     // Pop the first hole.
-    NEST_FORCEINLINE static void pop_hole( Unit block, Skipfield next_hole ) noexcept
+    NEST_FORCEINLINE static void pop_hole( Chunk block, Skipfield next_hole ) noexcept
     {
       assert( block->first_hole != Index::npos );
       block->first_hole = next_hole;
       if ( next_hole != Index::npos )
         index_at( block, next_hole ).prev = Index::npos;
     }
-    NEST_FORCEINLINE static void remove_hole( Unit block, Index index ) noexcept
+    NEST_FORCEINLINE static void remove_hole( Chunk block, Index index ) noexcept
     {
       assert( block->first_hole != Index::npos );
       if ( index.prev != Index::npos )
@@ -2080,7 +2105,7 @@ namespace nest {
     { as_skipfield( first ) = as_skipfield( address_at<Skipfield>( first, length - 1 ) ) = length; }
     /// @brief Create a hole in the block.
     /// @param pos The position of the first element.
-    NEST_FORCEINLINE static void build_hole( Unit block, Skipfield pos, Skipfield length ) noexcept
+    NEST_FORCEINLINE static void build_hole( Chunk block, Skipfield pos, Skipfield length ) noexcept
     {
       assert( pos + length - 1 != Index::npos );
       assert( block->first_hole == Index::npos );
@@ -2095,7 +2120,7 @@ namespace nest {
     }
     /// @brief Add a new hole to the block.
     /// @param pos The position of the first element.
-    NEST_FORCEINLINE static void add_hole( Unit block, Skipfield pos, Skipfield length ) noexcept
+    NEST_FORCEINLINE static void add_hole( Chunk block, Skipfield pos, Skipfield length ) noexcept
     {
       assert( pos + length - 1 != Index::npos );
       if ( block->first_hole != Index::npos ) {
@@ -2143,7 +2168,7 @@ namespace nest {
         build_hole( block, pos, length );
     }
     /// @brief Add a new hole that does not have any backward holes.
-    NEST_FORCEINLINE static void add_suffix_hole( Unit block, Skipfield pos, Skipfield length ) noexcept
+    NEST_FORCEINLINE static void add_suffix_hole( Chunk block, Skipfield pos, Skipfield length ) noexcept
     {
       assert( pos + length - 1 != Index::npos );
       if ( block->first_hole != Index::npos ) {
@@ -2175,7 +2200,7 @@ namespace nest {
         build_hole( block, pos, length );
     }
     /// @brief Add a new hole that does not have any forward holes.
-    NEST_FORCEINLINE static void add_prefix_hole( Unit block, Skipfield pos, Skipfield length ) noexcept
+    NEST_FORCEINLINE static void add_prefix_hole( Chunk block, Skipfield pos, Skipfield length ) noexcept
     {
       assert( pos + length - 1 != Index::npos );
       if ( block->first_hole != Index::npos ) {
@@ -2197,7 +2222,7 @@ namespace nest {
         build_hole( block, pos, length );
     }
 
-    static constexpr Unit allocate( BlockAlloc& block_alloc, AreaAlloc& area_alloc, size_type cap )
+    static constexpr Chunk allocate( BlockAlloc& block_alloc, AreaAlloc& area_alloc, size_type cap )
     {
       const auto scheme  = typename Layout::scheme_type { cap, cap + 1u };
       const auto element = Layout::allocate( area_alloc, scheme );
@@ -2221,7 +2246,7 @@ namespace nest {
         },
         [&] { Layout::deallocate( area_alloc, element, cap ); } );
     }
-    static constexpr void deallocate( BlockAlloc& block_alloc, AreaAlloc& area_alloc, Unit block ) noexcept
+    static constexpr void deallocate( BlockAlloc& block_alloc, AreaAlloc& area_alloc, Chunk block ) noexcept
     {
       Layout::deallocate( area_alloc, block->element, { block->capacity, block->capacity + 1u } );
       std::allocator_traits<BlockAlloc>::destroy( block_alloc, std::to_address( block ) );
@@ -2229,7 +2254,7 @@ namespace nest {
     }
 
     // Discard all the blocks in the idle list.
-    static constexpr size_type discard( BlockAlloc& block_alloc, AreaAlloc& area_alloc, Unit& idle ) noexcept
+    static constexpr size_type discard( BlockAlloc& block_alloc, AreaAlloc& area_alloc, Chunk& idle ) noexcept
     {
       assert( idle != nullptr );
       size_type discarded_cap = 0;
@@ -2244,7 +2269,7 @@ namespace nest {
     // Discard the blocks in the idle list that do not meet the limits restrictions.
     static constexpr size_type discard_unfit( BlockAlloc& block_alloc,
                                               AreaAlloc& area_alloc,
-                                              Unit& idle,
+                                              Chunk& idle,
                                               HiveLimits limits ) noexcept
     {
       assert( idle != nullptr );
@@ -2267,10 +2292,10 @@ namespace nest {
     }
 
     /// @return (List, real_capacity)
-    static constexpr std::pair<Unit, size_type> reserve_for( BlockAlloc& block_alloc,
-                                                             AreaAlloc& area_alloc,
-                                                             size_type capacity,
-                                                             HiveLimits limits )
+    static constexpr std::pair<Chunk, size_type> reserve_for( BlockAlloc& block_alloc,
+                                                              AreaAlloc& area_alloc,
+                                                              size_type capacity,
+                                                              HiveLimits limits )
     {
       assert( capacity > 0 );
       const auto min_quantity = ( capacity + limits.max - 1 ) / limits.max;
@@ -2278,7 +2303,7 @@ namespace nest {
       const auto average_cap = capacity / min_quantity;
       assert( average_cap <= limits.max );
 
-      Unit list = nullptr;
+      Chunk list = nullptr;
       if ( average_cap < limits.min ) {
         attach( list, allocate( block_alloc, area_alloc, limits.min ) );
         details::utils::attempt(
@@ -2453,7 +2478,7 @@ namespace nest {
     }
     // Destroy all the content in the block.
     // This function will delete the entire hole linked list.
-    NEST_FORCEINLINE Skipfield remove( Unit block ) noexcept
+    NEST_FORCEINLINE Skipfield remove( Chunk block ) noexcept
     {
       assert( block->occupied > 0 );
       purge( iterator::start_of( block ) );
@@ -2462,7 +2487,7 @@ namespace nest {
     }
 
     // Eliminate all the elements and blocks in the list.
-    size_type eliminate( BlockAlloc& block_alloc, AreaAlloc& area_alloc, Unit& busy ) noexcept
+    size_type eliminate( BlockAlloc& block_alloc, AreaAlloc& area_alloc, Chunk& busy ) noexcept
     {
       assert( busy != nullptr );
       size_type num_eliminated = 0;
@@ -2604,10 +2629,10 @@ namespace nest {
     ///        And there is only one hollow block in the List.
     /// @return (List, total_size)
     template<bool Const>
-    std::pair<Unit, size_type> migrate( Unit& idle, Iterator<Const>& source )
+    std::pair<Chunk, size_type> migrate( Chunk& idle, Iterator<Const>& source )
     {
       size_type num_transferred = 0;
-      Unit list                 = nullptr;
+      Chunk list                = nullptr;
       auto hole                 = Filler::from( idle );
       details::utils::attempt(
         [&] {
@@ -2660,11 +2685,11 @@ namespace nest {
     /// @brief Reconstruct all the blocks from the source.
     /// @return See `transfer_to`.
     template<bool Const>
-    std::pair<Unit, size_type> rebuild_from( BlockAlloc& block_alloc,
-                                             AreaAlloc& area_alloc,
-                                             Iterator<Const> source,
-                                             size_type total_size,
-                                             HiveLimits limits )
+    std::pair<Chunk, size_type> rebuild_from( BlockAlloc& block_alloc,
+                                              AreaAlloc& area_alloc,
+                                              Iterator<Const> source,
+                                              size_type total_size,
+                                              HiveLimits limits )
     {
       auto [blanks, total_capacity] = reserve_for( block_alloc, area_alloc, total_size, limits );
       return details::utils::attempt(
@@ -2726,7 +2751,7 @@ namespace nest {
     // Convert an empty block into a hollow block.
     template<typename... Args>
       requires std::is_constructible_v<Tp, Args...>
-    NEST_FORCEINLINE iterator fill_blank( Unit blank, Args&&... args )
+    NEST_FORCEINLINE iterator fill_blank( Chunk blank, Args&&... args )
     {
       assert( blank->occupied == 0 );
       assert( blank->capacity >= 1 );
@@ -2738,7 +2763,7 @@ namespace nest {
     }
 
     // Fill a batch data into an empty block and convert it into a hollow block (if count < capacity).
-    void fill_blank( Unit blank, std::input_iterator auto& iter, Skipfield count )
+    void fill_blank( Chunk blank, std::input_iterator auto& iter, Skipfield count )
     {
       assert( count > 0 );
       assert( blank->occupied == 0 );
@@ -2750,7 +2775,7 @@ namespace nest {
         build_hole( blank, count, blank->capacity - count );
     }
     // Fill the empty blank with `const Tp&` and convert it into a hollow block (if count < capacity).
-    void fill_blank( Unit blank, const Tp& value, Skipfield count )
+    void fill_blank( Chunk blank, const Tp& value, Skipfield count )
     {
       assert( count > 0 );
       assert( blank->occupied == 0 );
@@ -2825,7 +2850,7 @@ namespace nest {
 
       if ( count == 0 )
         return;
-      const auto consume = [&]( Unit& list ) {
+      const auto consume = [&]( Chunk& list ) {
         const auto num_constructed = (std::min<size_type>)( list->capacity, count );
         fill_blank( list, source, static_cast<Skipfield>( num_constructed ) );
         occupied_ += num_constructed;
@@ -2893,7 +2918,7 @@ namespace nest {
 
       if ( first == sentinel )
         return;
-      const auto consume = [&]( Unit& list ) {
+      const auto consume = [&]( Chunk& list ) {
         auto hole = Filler::from( list );
         details::utils::ensure(
           [&] {
