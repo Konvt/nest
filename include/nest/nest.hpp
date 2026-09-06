@@ -375,68 +375,42 @@ namespace nest {
       Skipfield next = npos;
     };
 
-    union Payload {
+    union Entry {
       Index index;
       Tp data;
 
       // The trivial will select the first member as the "active but uninitialized" member
-      constexpr Payload() = default;
+      constexpr Entry() = default;
 
-      constexpr ~Payload()
+      constexpr ~Entry()
         requires std::is_trivially_destructible_v<Tp>
       = default;
-      constexpr ~Payload() noexcept {}
+      constexpr ~Entry() noexcept {}
 
-      Payload( const Payload& )            = delete;
-      Payload& operator=( const Payload& ) = delete;
+      Entry( const Entry& )            = delete;
+      Entry& operator=( const Entry& ) = delete;
 
-      constexpr Payload( Index idx ) noexcept : index { idx } {}
-      constexpr Payload( const Tp& item ) noexcept( std::is_nothrow_copy_constructible_v<Tp> ) : data { item }
+      constexpr Entry( Index idx ) noexcept : index { idx } {}
+      constexpr Entry( const Tp& item ) noexcept( std::is_nothrow_copy_constructible_v<Tp> ) : data { item }
       {}
-      constexpr Payload( Tp&& item ) noexcept( std::is_nothrow_move_constructible_v<Tp> )
+      constexpr Entry( Tp&& item ) noexcept( std::is_nothrow_move_constructible_v<Tp> )
         : data { std::move( item ) }
       {}
 
       template<typename... Args>
       // Avoid ambiguity with the default constructor
-      constexpr Payload( std::in_place_t, Args&&... args )
+      constexpr Entry( std::in_place_t, Args&&... args )
         noexcept( std::is_nothrow_constructible_v<Tp, Args...> )
         : data { std::forward<Args>( args )... }
       { static_assert( std::is_constructible_v<Tp, Args...> ); }
     };
 
-    using Layout    = details::utils::SoALayout<Payload, Skipfield>;
+    using Layout    = details::utils::SoALayout<Entry, Skipfield>;
     using AreaAlloc = Layout::template rebind_alloc<Alloc>;
-    using Area =
-      std::pointer_traits<typename std::allocator_traits<AreaAlloc>::pointer>::template rebind<std::byte>;
-    /// NOTE:
-    /// The standard library is very weak in handling type conversions for fancy pointers.
-    /// If we need strict support for all user-provided allocators while preserving
-    /// the validity of fancy pointers,
-    /// we must give up constexpr execution capability (due to pointer reinterpretation involved).
-
-    /// Specifically, for performance reasons, we adopted a SoA layout that allocates
-    /// Payload and Skipfield together.
-    /// This structure requires us to allocate an entire array aligned to the maximum alignment
-    /// of T and Skipfield,
-    /// then split it at corresponding offsets to obtain the starting address of the target array.
-
-    /// However, if the allocator returns a pointer that is not a plain pointer type,
-    /// there will be issues with pointer type conversion during memory block splitting.
-    /// In such cases, the only valid way to perform pointer conversion is via pointer_traits::pointer_to,
-    /// but this function requires a T& argument rather than a T*.
-    /// Clearly, we cannot obtain a valid T& before constructing an object
-    /// (which would violate lifetime constraints),
-    /// effectively preventing us from holding separate fancy pointers to Payload and Skipfield.
-
-    /// The current implementation uses an intermediate pointer type (std::byte),
-    /// which satisfies strict aliasing exemption and implicit-lifetime properties,
-    /// allowing us to activate the lifetime of this type even without calling a constructor.
-    /// However, the cost is that we must address memory by bytes,
-    /// and due to unavoidable reinterpretations, we cannot execute operations at compile time.
-
-    /// Even though almost all mainstream implementations of fancy pointers currently
-    /// support construction from raw pointers.
+    using Item =
+      std::pointer_traits<typename std::allocator_traits<AreaAlloc>::pointer>::template rebind<Entry>;
+    using Ramp =
+      std::pointer_traits<typename std::allocator_traits<AreaAlloc>::pointer>::template rebind<Skipfield>;
 
     struct Block;
     using BlockAlloc = std::allocator_traits<Alloc>::template rebind_alloc<Block>;
@@ -456,8 +430,8 @@ namespace nest {
     // it can be considered as exceeding the representation range of the current block.
     // This design also comes from the plf::hive.
     struct Block {
-      Area skipfield = nullptr;
-      Area element   = nullptr;
+      Ramp skipfield = nullptr;
+      Item element   = nullptr;
 
       Skipfield first_hole = Index::npos;
       Skipfield occupied   = 0;
@@ -475,29 +449,6 @@ namespace nest {
       Chunk next_hollow = nullptr;
     };
 
-    NEST_FORCEINLINE static Payload& as_payload( Area ptr ) noexcept
-    { return *details::utils::launder_as<Payload>( ptr ); }
-    NEST_FORCEINLINE static Tp& as_data( Area ptr ) noexcept { return as_payload( ptr ).data; }
-    NEST_FORCEINLINE static Index& as_index( Area ptr ) noexcept { return as_payload( ptr ).index; }
-    NEST_FORCEINLINE static Skipfield& as_skipfield( Area ptr ) noexcept
-    { return *details::utils::launder_as<Skipfield>( ptr ); }
-
-    template<typename U = std::byte>
-    NEST_FORCEINLINE static constexpr Area address_at(
-      Area origin,
-      typename std::allocator_traits<AreaAlloc>::difference_type offset ) noexcept
-    { return origin + offset * sizeof( U ); }
-    template<typename U>
-    NEST_FORCEINLINE static U* as_address(
-      Area origin,
-      typename std::allocator_traits<AreaAlloc>::difference_type offset ) noexcept
-    { return details::utils::pointer_cast<U*>( address_at<U>( origin, offset ) ); }
-
-    NEST_FORCEINLINE static Index& index_at( Chunk block, Skipfield pos ) noexcept
-    { return as_index( address_at<Payload>( block->element, pos ) ); }
-    NEST_FORCEINLINE static Skipfield& skipfield_at( Chunk block, Skipfield pos ) noexcept
-    { return as_skipfield( address_at<Skipfield>( block->skipfield, pos ) ); }
-
     static constexpr auto max_default_capacity() noexcept
     { // Capacity limit calculation follows the reference implementation of P0447 (plf::hive).
       return static_cast<Skipfield>(
@@ -509,7 +460,7 @@ namespace nest {
     {
       return (std::max<Skipfield>)( 8u,
                                     (std::min<size_type>)( ( ( sizeof( Hive ) + sizeof( Block ) ) * 2 )
-                                                             / sizeof( Payload ),
+                                                             / sizeof( Entry ),
                                                            max_default_capacity() ) );
     }
 
@@ -518,32 +469,37 @@ namespace nest {
       friend class Filler;
       friend Hive;
 
-      Area element_   = nullptr;
-      Area skipfield_ = nullptr;
+      Ramp skipfield_ = nullptr;
+      Item element_   = nullptr;
       Chunk block_    = nullptr;
 
       // Detect whether the iterator is at the end of the current block.
-      NEST_FORCEINLINE constexpr bool exhausted() const noexcept { return element_ >= block_->skipfield; }
+      NEST_FORCEINLINE constexpr bool exhausted() const noexcept
+      {
+        return details::utils::pointer_cast<const void*>( element_ )
+            >= details::utils::pointer_cast<const void*>( block_->skipfield );
+      }
       // The rest length of the current block.
       NEST_FORCEINLINE constexpr Skipfield rest() const noexcept
       { // Regarding the alignment and padding filling issues,
         // please refer to the comments of the `allocate` method for details.
         assert( exhausted() == false );
-        return static_cast<Skipfield>( ( block_->skipfield - element_ ) / sizeof( Payload ) );
+        return static_cast<Skipfield>( ( details::utils::pointer_cast<const std::byte*>( block_->skipfield )
+                                         - details::utils::pointer_cast<const std::byte*>( element_ ) )
+                                       / sizeof( Entry ) );
       }
       NEST_FORCEINLINE constexpr Skipfield offset() const noexcept
-      { return static_cast<Skipfield>( ( skipfield_ - block_->skipfield ) / sizeof( Skipfield ) ); }
+      { return static_cast<Skipfield>( skipfield_ - block_->skipfield ); }
 
       // This method will not automatically advance the iterator to the next block.
       // And it will return a boolean indicating whether the iterator is still valid.
-      bool advance() noexcept
+      constexpr bool advance() noexcept
       { // Regarding the reason why "incrementing when pointing to the last element of the array
         // does not cause the skipfield_ pointer to go out of bounds",
         // please refer to the comments within the `allocate` method.
-        skipfield_ = address_at<Skipfield>( skipfield_, 1 );
-        element_   = address_at<Payload>( element_, as_skipfield( skipfield_ ) + 1 );
+        element_ += *( ++skipfield_ ) + 1;
         if ( !exhausted() ) [[likely]] {
-          skipfield_ = address_at<Skipfield>( skipfield_, as_skipfield( skipfield_ ) );
+          skipfield_ += *skipfield_;
           return true;
         }
         return false;
@@ -552,45 +508,47 @@ namespace nest {
       // Advance the iterator by the sepcified number of steps, it will automatically skip over the hole.
       // This function **assumes** that:
       // the target position must be either a hole endpoint, a sentinel position, or a valid element.
-      bool advance( Skipfield step ) noexcept
+      constexpr bool advance( Skipfield step ) noexcept
       { // internal tool
-        skipfield_ = address_at<Skipfield>( skipfield_, step );
-        element_   = address_at<Payload>( element_, step + as_skipfield( skipfield_ ) );
-        skipfield_ = address_at<Skipfield>( skipfield_, as_skipfield( skipfield_ ) );
+        skipfield_ += step;
+        element_ += step + *skipfield_;
+        skipfield_ += *skipfield_;
         return !exhausted();
       }
 
       // Step the iterator to the next block.
-      bool next() noexcept
+      constexpr bool next() noexcept
       {
         if ( block_->next != nullptr ) {
           block_     = block_->next;
-          element_   = address_at<Payload>( block_->element, as_skipfield( block_->skipfield ) );
-          skipfield_ = address_at<Skipfield>( block_->skipfield, as_skipfield( block_->skipfield ) );
+          element_   = block_->element + *block_->skipfield;
+          skipfield_ = block_->skipfield + *block_->skipfield;
           return true;
         }
         return false;
       }
 
       // Get the mutable reference of the data.
-      NEST_FORCEINLINE Tp& mut() const noexcept { return as_data( element_ ); }
+      NEST_FORCEINLINE constexpr Tp& mut() const noexcept { return element_->data; }
 
-      constexpr Iterator( Area element, Area skipfield, Chunk block ) noexcept
-        : element_ { element }, skipfield_ { skipfield }, block_ { block }
+      constexpr Iterator( Item element, Ramp skipfield, Chunk block ) noexcept
+        : skipfield_ { skipfield }, element_ { element }, block_ { block }
       {}
 
       template<bool C>
       NEST_FORCEINLINE static constexpr Iterator from( Iterator<C> other ) noexcept
       { return { other.element_, other.skipfield_, other.block_ }; }
 
-      NEST_FORCEINLINE static Iterator start_of( Chunk block ) noexcept
-      {
-        return { address_at<Payload>( block->element, as_skipfield( block->skipfield ) ),
-                 address_at<Skipfield>( block->skipfield, as_skipfield( block->skipfield ) ),
+      NEST_FORCEINLINE static constexpr Iterator start_of( Chunk block ) noexcept
+      { return { block->element + *block->skipfield, block->skipfield + *block->skipfield, block }; }
+      NEST_FORCEINLINE static constexpr Iterator sentinel_of( Chunk block ) noexcept
+      { // see `allocate`
+        if constexpr ( std::is_class_v<Item> && !std::is_constructible_v<Item, Entry*> )
+          return { block->element + block->capacity, block->skipfield + block->capacity, block };
+        return { details::utils::pointer_cast<Item>( block->skipfield ),
+                 block->skipfield + block->capacity,
                  block };
       }
-      NEST_FORCEINLINE static Iterator sentinel_of( Chunk block ) noexcept
-      { return { block->skipfield, address_at<Skipfield>( block->skipfield, block->capacity ), block }; }
 
     public:
       using iterator_category = std::bidirectional_iterator_tag;
@@ -601,41 +559,43 @@ namespace nest {
 
       constexpr Iterator() = default;
 
-      pointer operator->() const noexcept { return std::addressof( mut() ); }
-      reference operator*() const noexcept { return mut(); }
+      constexpr pointer operator->() const noexcept { return std::addressof( mut() ); }
+      constexpr reference operator*() const noexcept { return mut(); }
 
-      Iterator& operator++() noexcept
+      constexpr Iterator& operator++() noexcept
       {
         if ( !advance() )
           next();
         return *this;
       }
-      Iterator operator++( int ) noexcept
+      constexpr Iterator operator++( int ) noexcept
       {
         auto copy = *this;
         operator++();
         return copy;
       }
 
-      Iterator& operator--() noexcept
+      constexpr Iterator& operator--() noexcept
       {
         assert( block_ != nullptr );
-        skipfield_ -= sizeof( Skipfield );
-        if ( skipfield_ >= block_->skipfield ) {
-          element_ -= ( static_cast<size_type>( as_skipfield( skipfield_ ) ) + 1 ) * sizeof( Payload );
-          skipfield_ -= as_skipfield( skipfield_ ) * sizeof( Skipfield );
+        if ( --skipfield_ >= block_->skipfield ) {
+          element_ -= *skipfield_ + 1;
+          skipfield_ -= *skipfield_;
           if ( skipfield_ >= block_->skipfield )
             return *this;
         }
 
         block_                    = block_->prev;
-        const auto prev_skipfield = address_at<Skipfield>( block_->skipfield, block_->capacity - 1 );
-        const auto skipped_bytes  = as_skipfield( prev_skipfield ) * sizeof( Payload );
-        element_                  = block_->skipfield - skipped_bytes - sizeof( Payload );
-        skipfield_                = prev_skipfield - skipped_bytes;
+        const auto prev_skipfield = block_->skipfield + block_->capacity - 1;
+        element_                  = // also see `allocate`
+          details::utils::pointer_cast<Item>(
+            details::utils::pointer_cast<typename std::pointer_traits<Ramp>::template rebind<std::byte>>(
+              block_->skipfield )
+            - ( *prev_skipfield * sizeof( Entry ) ) );
+        skipfield_ = prev_skipfield - *prev_skipfield;
         return *this;
       }
-      Iterator operator--( int ) noexcept
+      constexpr Iterator operator--( int ) noexcept
       {
         auto copy = *this;
         operator--();
@@ -662,12 +622,12 @@ namespace nest {
       friend Hive;
 
     protected:
-      Area element_   = nullptr;
-      Area skipfield_ = nullptr;
+      Item element_   = nullptr;
+      Ramp skipfield_ = nullptr;
       Chunk block_    = nullptr;
       Skipfield rest_ = 0; // the rest length of this hole
 
-      constexpr Filler( Area element, Area skipfield, Chunk block ) noexcept
+      constexpr Filler( Item element, Ramp skipfield, Chunk block ) noexcept
         : element_ { element }, skipfield_ { skipfield }, block_ { block }
       {}
 
@@ -681,26 +641,26 @@ namespace nest {
       }
 
       template<typename... Args>
-      NEST_FORCEINLINE void occupy( Alloc& alloc, Args&&... args ) const
+      NEST_FORCEINLINE constexpr void occupy( Alloc& alloc, Args&&... args ) const
         noexcept( std::is_nothrow_constructible_v<Tp, Args...> )
       {
         static_assert( std::is_constructible_v<Tp, Args...> );
         std::allocator_traits<Alloc>::construct( alloc,
-                                                 details::utils::pointer_cast<Payload*>( element_ ),
+                                                 std::to_address( element_ ),
                                                  std::in_place,
                                                  std::forward<Args>( args )... );
-        as_skipfield( skipfield_ ) = 0;
+        std::construct_at( std::to_address( skipfield_ ), 0 );
       }
 
       NEST_FORCEINLINE constexpr Skipfield rest() const noexcept { return rest_; }
       NEST_FORCEINLINE constexpr Skipfield offset() const noexcept
-      { return static_cast<Skipfield>( ( skipfield_ - block_->skipfield ) / sizeof( Skipfield ) ); }
+      { return static_cast<Skipfield>( skipfield_ - block_->skipfield ); }
 
       constexpr bool advance() noexcept
       {
         if ( --rest_ > 0 ) {
-          element_   = address_at<Payload>( element_, 1 );
-          skipfield_ = address_at<Skipfield>( skipfield_, 1 );
+          ++element_;
+          ++skipfield_;
           return true;
         }
         return false;
@@ -712,8 +672,8 @@ namespace nest {
         assert( step <= rest_ );
         rest_ -= step;
         if ( rest_ > 0 ) {
-          element_   = address_at<Payload>( element_, step );
-          skipfield_ = address_at<Skipfield>( skipfield_, step );
+          element_ += step;
+          skipfield_ += step;
           return true;
         }
         return false;
@@ -735,140 +695,63 @@ namespace nest {
     public:
       constexpr Muncher() = default;
 
-      NEST_FORCEINLINE static Muncher from( Chunk hollow ) noexcept
+      NEST_FORCEINLINE static constexpr Muncher from( Chunk hollow ) noexcept
       {
         assert( hollow->occupied < hollow->capacity );
-        Muncher cursor { address_at<Payload>( hollow->element, hollow->first_hole ),
-                         address_at<Skipfield>( hollow->skipfield, hollow->first_hole ),
+        Muncher cursor { hollow->element + hollow->first_hole,
+                         hollow->skipfield + hollow->first_hole,
                          hollow };
-        cursor.rest_  = as_skipfield( cursor.skipfield_ );
-        cursor.index_ = as_index( cursor.element_ );
-        cursor.element_ -= ( cursor.rest_ - 1 ) * sizeof( Payload );
-        cursor.skipfield_ -= ( cursor.rest_ - 1 ) * sizeof( Skipfield );
+        cursor.rest_  = *cursor.skipfield_;
+        cursor.index_ = cursor.element_->index;
+        cursor.element_ -= cursor.rest_ - 1;
+        cursor.skipfield_ -= cursor.rest_ - 1;
         return cursor;
       }
 
-      bool advance() noexcept
+      constexpr bool advance() noexcept
       {
         if ( --this->rest_ > 0 ) {
-          this->element_   = address_at<Payload>( this->element_, 1 );
-          this->skipfield_ = address_at<Skipfield>( this->skipfield_, 1 );
+          ++this->element_;
+          ++this->skipfield_;
           return true;
         }
         pop_hole( this->block_, index_.next );
         if ( index_.next != Index::npos ) {
-          this->element_   = address_at<Payload>( this->block_->element, index_.next );
-          this->skipfield_ = address_at<Skipfield>( this->block_->skipfield, index_.next );
-          this->rest_      = as_skipfield( this->skipfield_ );
+          this->element_   = this->block_->element + index_.next;
+          this->skipfield_ = this->block_->skipfield + index_.next;
+          this->rest_      = *this->skipfield_;
           assert( this->rest_ > 0 );
-          index_ = as_index( address_at<Payload>( this->element_, this->rest_ - 1 ) );
-          this->element_ -= ( this->rest_ - 1 ) * sizeof( Payload );
-          this->skipfield_ -= ( this->rest_ - 1 ) * sizeof( Skipfield );
+          index_ = this->element_->index;
+          this->element_ -= this->rest_ - 1;
+          this->skipfield_ -= this->rest_ - 1;
           return true;
         }
         return false;
       }
 
       // Take `step` steps forward in the current hole.
-      bool advance( Skipfield step ) noexcept
+      constexpr bool advance( Skipfield step ) noexcept
       {
         assert( step <= this->rest_ );
         this->rest_ -= step;
         if ( this->rest_ > 0 ) {
-          this->element_   = address_at<Payload>( this->element_, step );
-          this->skipfield_ = address_at<Skipfield>( this->skipfield_, step );
+          this->element_   = this->element_ + step;
+          this->skipfield_ = this->skipfield_ + step;
           return true;
         }
         pop_hole( this->block_, index_.next );
         if ( index_.next != Index::npos ) {
-          this->element_   = address_at<Payload>( this->block_->element, index_.next );
-          this->skipfield_ = address_at<Skipfield>( this->block_->skipfield, index_.next );
-          this->rest_      = as_skipfield( this->skipfield_ );
+          this->element_   = this->block_->element + index_.next;
+          this->skipfield_ = this->block_->skipfield + index_.next;
+          this->rest_      = *this->skipfield_;
           assert( this->rest_ > 0 );
-          index_ = as_index( this->element_ );
-          this->element_ -= ( this->rest_ - 1 ) * sizeof( Payload );
-          this->skipfield_ -= ( this->rest_ - 1 ) * sizeof( Skipfield );
+          index_ = this->element_->index;
+          this->element_ -= this->rest_ - 1;
+          this->skipfield_ -= this->rest_ - 1;
           return true;
         }
         return false;
       }
-    };
-
-    // An iterator that projects the type `Payload&` to `Tp&`.
-    class Accessor {
-      Payload* current_;
-
-    public:
-      constexpr Accessor( Payload* current ) noexcept : current_ { current } {}
-
-      NEST_FORCEINLINE static constexpr Accessor from_address( Area ptr ) noexcept
-      {
-        assert( ptr != nullptr );
-        return { details::utils::pointer_cast<Payload*>( ptr ) };
-      }
-      NEST_FORCEINLINE static Accessor from_object( Area ptr ) noexcept
-      {
-        assert( ptr != nullptr );
-        return { details::utils::launder_as<Payload>( ptr ) };
-      }
-
-      using iterator_category = std::contiguous_iterator_tag;
-      using value_type        = Tp;
-      using pointer           = value_type*;
-      using reference         = value_type&;
-      using difference_type   = std::ptrdiff_t;
-
-      constexpr pointer operator->() const noexcept { return std::addressof( current_->data ); }
-      constexpr reference operator*() const noexcept { return current_->data; }
-      constexpr reference operator[]( difference_type dist ) const noexcept { return current_[dist]; }
-
-      constexpr Accessor& operator++() noexcept
-      {
-        ++current_;
-        return *this;
-      }
-      constexpr Accessor operator++( int ) noexcept
-      {
-        auto copy = *this;
-        operator++();
-        return copy;
-      }
-
-      constexpr Accessor& operator--() noexcept
-      {
-        --current_;
-        return *this;
-      }
-      constexpr Accessor operator--( int ) noexcept
-      {
-        auto copy = *this;
-        operator--();
-        return copy;
-      }
-
-      friend constexpr Accessor operator+( Accessor iter, difference_type dist ) noexcept
-      { return { iter.current_ + dist }; }
-      friend constexpr Accessor operator+( difference_type dist, Accessor iter ) noexcept
-      { return { iter.current_ + dist }; }
-      friend constexpr Accessor operator-( Accessor iter, difference_type dist ) noexcept
-      { return { iter.current_ - dist }; }
-      friend constexpr difference_type operator-( Accessor a, Accessor b ) noexcept
-      { return { a.current_ - b.current_ }; }
-
-      friend constexpr Accessor& operator+=( Accessor& iter, difference_type dist ) noexcept
-      {
-        iter.current_ += dist;
-        return iter;
-      }
-      friend constexpr Accessor& operator-=( Accessor& iter, difference_type dist ) noexcept
-      {
-        iter.current_ -= dist;
-        return iter;
-      }
-
-      friend constexpr auto operator<=>( const Accessor&, const Accessor& ) = default;
-      friend constexpr bool operator==( const Accessor&, const Accessor& )  = default;
-      friend constexpr bool operator!=( const Accessor&, const Accessor& )  = default;
     };
 
   public:
@@ -919,11 +802,11 @@ namespace nest {
               if constexpr ( details::traits::AllocatorTriviallyConstructible<Alloc, Tp>
                              && (details::traits::AllocatorTriviallyDestructible<Alloc, Tp>
                                  || std::is_nothrow_default_constructible_v<Tp>))
-                std::uninitialized_fill_n( details::utils::pointer_cast<Payload*>( blanks->element ),
+                std::uninitialized_fill_n( std::to_address( blanks->element ),
                                            num_constructed,
                                            std::in_place );
               else {
-                auto target = details::utils::pointer_cast<Payload*>( blanks->element );
+                auto target = std::to_address( blanks->element );
                 details::utils::attempt(
                   [&] {
                     Skipfield total_constructed = 0;
@@ -935,7 +818,7 @@ namespace nest {
                   },
                   [&, origin = target] {
                     if ( origin != target )
-                      purge( Accessor( std::launder( origin ) ), Accessor( target ) );
+                      purge( std::to_address( origin ), std::to_address( target ) );
                   } );
               }
               std::memset( details::utils::pointer_cast<void*>( blanks->skipfield ),
@@ -1159,12 +1042,13 @@ namespace nest {
       assert( obj != nullptr );
       const auto addr = details::utils::pointer_cast<const std::byte*>( obj );
       auto block      = head_;
-      while ( addr < std::to_address( block->element ) || addr >= std::to_address( block->skipfield ) )
+      while ( addr < details::utils::pointer_cast<const std::byte*>( block->element )
+              || addr >= details::utils::pointer_cast<const std::byte*>( block->skipfield ) )
         // For the safety of the last comparison, please refer to the comments in `Iterator::exhaust`.
         block = block->next;
       assert( block != nullptr );
-      const auto offset = addr - std::to_address( block->element );
-      // the unit of offset is byte
+      const auto offset =
+        ( addr - details::utils::pointer_cast<const std::byte*>( block->element ) ) / sizeof( Entry );
       return { block->element + offset, block->skipfield + offset, block };
     }
     [[nodiscard]] iterator get_iterator( const_pointer obj ) noexcept
@@ -1735,10 +1619,10 @@ namespace nest {
         return;
       if constexpr ( sizeof( Tp ) <= 2 * sizeof( void* )
                      && (std::is_trivially_copyable_v<Tp> || std::is_move_assignable_v<Tp>)) {
-        // Since Tp is a sub-object of Payload,
+        // Since Tp is a sub-object of Entry,
         // the element pointed to by the free memory block must meet the alignment requirements of Tp;
         // and if there is such a free block with the size that meets our needs, we will reuse its memory.
-        static_assert( alignof( Tp ) <= alignof( Payload ) );
+        static_assert( alignof( Tp ) <= alignof( Entry ) );
         auto borrowed = borrow_from( vacuum_, occupied_ * sizeof( Tp ) );
         if ( borrowed != nullptr )
           direct_sort( details::utils::pointer_cast<Tp*>( borrowed->element ), std::move( comp ) );
@@ -1826,28 +1710,29 @@ namespace nest {
         auto element   = block->element;
         auto skipfield = block->skipfield;
         while ( true ) {
-          if ( as_skipfield( skipfield ) > 0 ) {
-            element          = address_at<Payload>( element, as_skipfield( skipfield ) - 1 );
-            const auto index = as_index( element );
-            oiter            = std::format_to( oiter, "{{{};", as_skipfield( skipfield ) );
+          if ( *skipfield > 0 ) {
+            element += *skipfield - 1;
+            const auto index = element->index;
+            oiter            = std::format_to( oiter, "{{{};", *skipfield );
             if ( index.prev == index.next ) {
               assert( index.prev == Index::npos );
               oiter = std::ranges::copy( "#.#", oiter ).out;
             } else if ( index.prev == Index::npos )
-              oiter = std::format_to( oiter, "#.{}", as_index( element ).next );
+              oiter = std::format_to( oiter, "#.{}", index.next );
             else if ( index.next == Index::npos )
-              oiter = std::format_to( oiter, "{}.#", as_index( element ).prev );
+              oiter = std::format_to( oiter, "{}.#", index.prev );
             else
-              oiter = std::format_to( oiter, "{}.{}", as_index( element ).prev, as_index( element ).next );
+              oiter = std::format_to( oiter, "{}.{}", index.prev, index.next );
             *( oiter++ ) = '}';
-            element      = address_at<Payload>( element, 1 );
-            skipfield    = address_at<Skipfield>( skipfield, as_skipfield( skipfield ) );
+            ++element;
+            skipfield += *skipfield;
           } else {
-            oiter     = std::format_to( oiter, "[{}]", as_data( element ) );
-            element   = address_at<Payload>( element, 1 );
-            skipfield = address_at<Skipfield>( skipfield, 1 );
+            oiter = std::format_to( oiter, "[{}]", element->data );
+            ++element;
+            ++skipfield;
           }
-          if ( element < block->skipfield )
+          if ( details::utils::pointer_cast<const void*>( element )
+               < details::utils::pointer_cast<const void*>( block->skipfield ) )
             oiter = std::ranges::copy( ", ", oiter ).out;
           else
             break;
@@ -1857,26 +1742,22 @@ namespace nest {
         skipfield                 = block->skipfield;
         Skipfield continuous_zero = 0;
         while ( true ) {
-          if ( as_skipfield( skipfield ) > 0 ) {
+          if ( *skipfield > 0 ) {
             if ( continuous_zero > 1 )
               oiter = std::format_to( oiter, "[0;{}], ", continuous_zero );
             else if ( continuous_zero > 0 )
               oiter = std::ranges::copy( "0, ", oiter ).out;
             continuous_zero = 0;
-            if ( as_skipfield( skipfield ) > 1 )
-              oiter = std::format_to(
-                oiter,
-                "{{{};...;{}}}",
-                as_skipfield( skipfield ),
-                as_skipfield( address_at<Skipfield>( skipfield, as_skipfield( skipfield ) - 1 ) ) );
+            if ( *skipfield > 1 )
+              oiter = std::format_to( oiter, "{{{};...;{}}}", *skipfield, *( skipfield + *skipfield - 1 ) );
             else
               *( oiter++ ) = '1';
-            skipfield = address_at<Skipfield>( skipfield, as_skipfield( skipfield ) );
+            skipfield += *skipfield;
           } else {
-            skipfield = address_at<Skipfield>( skipfield, 1 );
+            ++skipfield;
             ++continuous_zero;
           }
-          if ( skipfield < address_at<Skipfield>( block->skipfield, block->capacity ) ) {
+          if ( skipfield < block->skipfield + block->capacity ) {
             if ( continuous_zero == 0 )
               oiter = std::ranges::copy( ", ", oiter ).out;
           } else {
@@ -2081,142 +1962,140 @@ namespace nest {
     }
 
     // Pop the first hole.
-    NEST_FORCEINLINE static void pop_hole( Chunk block, Skipfield next_hole ) noexcept
+    NEST_FORCEINLINE static constexpr void pop_hole( Chunk block, Skipfield next_hole ) noexcept
     {
       assert( block->first_hole != Index::npos );
       block->first_hole = next_hole;
       if ( next_hole != Index::npos )
-        index_at( block, next_hole ).prev = Index::npos;
+        ( block->element + next_hole )->index.prev = Index::npos;
     }
-    NEST_FORCEINLINE static void remove_hole( Chunk block, Index index ) noexcept
+    NEST_FORCEINLINE static constexpr void remove_hole( Chunk block, Index index ) noexcept
     {
       assert( block->first_hole != Index::npos );
       if ( index.prev != Index::npos )
-        index_at( block, index.prev ).next = index.next;
+        ( block->element + index.prev )->index.next = index.next;
       else
         block->first_hole = index.next;
       if ( index.next != Index::npos )
-        index_at( block, index.next ).prev = index.prev;
+        ( block->element + index.next )->index.prev = index.prev;
     }
 
     /// @brief Fix the length information of the hole
     /// @param length The new length.
-    NEST_FORCEINLINE static void fix_hole( Area first, Skipfield length ) noexcept
-    { as_skipfield( first ) = as_skipfield( address_at<Skipfield>( first, length - 1 ) ) = length; }
+    NEST_FORCEINLINE static constexpr void fix_hole( Ramp first, Skipfield length ) noexcept
+    {
+      std::construct_at( std::to_address( first ), length );
+      *( first + length - 1 ) = length;
+    }
     /// @brief Create a hole in the block.
     /// @param pos The position of the first element.
-    NEST_FORCEINLINE static void build_hole( Chunk block, Skipfield pos, Skipfield length ) noexcept
+    NEST_FORCEINLINE static constexpr void build_hole( Chunk block, Skipfield pos, Skipfield length ) noexcept
     {
       assert( pos + length - 1 != Index::npos );
       assert( block->first_hole == Index::npos );
-      const auto origin =
-        details::utils::pointer_cast<Skipfield*>( address_at<Skipfield>( block->skipfield, pos ) );
+      const auto origin = std::to_address( block->skipfield ) + pos;
       std::construct_at( origin, length );
       std::construct_at( origin + length - 1, length );
       // The index is only present in the last element.
-      std::construct_at( as_address<Payload>( block->element, pos + length - 1 ),
+      std::construct_at( std::to_address( block->element ) + pos + length - 1,
                          Index { Index::npos, Index::npos } );
       block->first_hole = pos + length - 1;
     }
     /// @brief Add a new hole to the block.
     /// @param pos The position of the first element.
-    NEST_FORCEINLINE static void add_hole( Chunk block, Skipfield pos, Skipfield length ) noexcept
+    NEST_FORCEINLINE static constexpr void add_hole( Chunk block, Skipfield pos, Skipfield length ) noexcept
     {
       assert( pos + length - 1 != Index::npos );
       if ( block->first_hole != Index::npos ) {
         // Pointers that are out of range but will not be dereferenced are safe.
-        const auto prev_neighbor = pos > 0 ? address_at<Skipfield>( block->skipfield, pos - 1 ) : nullptr;
+        const auto prev_neighbor = pos > 0 ? block->skipfield + pos - 1 : nullptr;
         // Note that allocate allocates an extra element at the end of the Skipfield array,
         // so dereferencing this pointer is always safe.
-        const auto next_neighbor = address_at<Skipfield>( block->skipfield, pos + length );
-        if ( pos > 0 && as_skipfield( prev_neighbor ) > 0 && as_skipfield( next_neighbor ) > 0 ) {
+        const auto next_neighbor = block->skipfield + pos + length;
+        if ( pos > 0 && *prev_neighbor > 0 && *next_neighbor > 0 ) {
           // merge both
-          skipfield_at( block, pos - as_skipfield( prev_neighbor ) ) =
-            skipfield_at( block, pos + length + as_skipfield( next_neighbor ) - 1 ) =
-              as_skipfield( prev_neighbor ) + as_skipfield( next_neighbor ) + length;
+          *( prev_neighbor - *prev_neighbor + 1 ) = *( next_neighbor + *next_neighbor - 1 ) =
+            *prev_neighbor + *next_neighbor + length;
           // erase left
-          remove_hole( block, index_at( block, pos - 1 ) );
-        } else if ( pos > 0 && as_skipfield( prev_neighbor ) > 0 ) {
+          remove_hole( block, ( block->element + pos - 1 )->index );
+        } else if ( pos > 0 && *prev_neighbor > 0 ) {
           // merge left
-          skipfield_at( block, pos - as_skipfield( prev_neighbor ) ) =
-            skipfield_at( block, pos + length - 1 ) = as_skipfield( prev_neighbor ) + length;
+          *( prev_neighbor - *prev_neighbor + 1 ) = *( block->skipfield + pos + length - 1 ) =
+            *prev_neighbor + length;
           // update left
-          const auto index                          = index_at( block, pos - 1 );
-          std::construct_at( as_address<Payload>( block->element, pos + length - 1 ), index );
+          const auto index = ( block->element + pos - 1 )->index;
+          std::construct_at( std::to_address( block->element ) + pos + length - 1, index );
           if ( index.prev != Index::npos )
-            index_at( block, index.prev ).next = pos + length - 1;
+            ( block->element + index.prev )->index.next = pos + length - 1;
           else {
             assert( block->first_hole == pos - 1 );
             block->first_hole = pos + length - 1;
           }
           if ( index.next != Index::npos )
-            index_at( block, index.next ).prev = pos;
-        } else if ( as_skipfield( next_neighbor ) > 0 ) {
+            ( block->element + index.next )->index.prev = pos;
+        } else if ( *next_neighbor > 0 )
           // merge right
-          skipfield_at( block, pos ) =
-            skipfield_at( block, pos + length + as_skipfield( next_neighbor ) - 1 ) =
-              as_skipfield( next_neighbor ) + length;
-        } else {
+          *( block->skipfield + pos ) = *( next_neighbor + *next_neighbor - 1 ) = *next_neighbor + length;
+        else {
           // create a new hole
-          skipfield_at( block, pos ) = skipfield_at( block, pos + length - 1 ) = length;
-          std::construct_at( as_address<Payload>( block->element, pos + length - 1 ),
+          *( block->skipfield + pos ) = *( block->skipfield + pos + length - 1 ) = length;
+          std::construct_at( std::to_address( block->element ) + pos + length - 1,
                              Index { Index::npos, block->first_hole } );
-          index_at( block, block->first_hole ).prev = pos + length - 1;
-          block->first_hole                         = pos + length - 1;
+          block->first_hole = ( block->element + block->first_hole )->index.prev = pos + length - 1;
         }
       } else
         build_hole( block, pos, length );
     }
     /// @brief Add a new hole that does not have any backward holes.
-    NEST_FORCEINLINE static void add_suffix_hole( Chunk block, Skipfield pos, Skipfield length ) noexcept
+    NEST_FORCEINLINE static constexpr void add_suffix_hole( Chunk block,
+                                                            Skipfield pos,
+                                                            Skipfield length ) noexcept
     {
       assert( pos + length - 1 != Index::npos );
       if ( block->first_hole != Index::npos ) {
-        const auto prev_neighbor = pos > 0 ? address_at<Skipfield>( block->skipfield, pos - 1 ) : nullptr;
-        if ( pos > 0 && as_skipfield( prev_neighbor ) > 0 ) {
+        const auto prev_neighbor = pos > 0 ? block->skipfield + pos - 1 : nullptr;
+        if ( pos > 0 && *prev_neighbor > 0 ) {
           // merge left
-          skipfield_at( block, pos - as_skipfield( prev_neighbor ) ) =
-            skipfield_at( block, pos + length - 1 ) = as_skipfield( prev_neighbor ) + length;
+          *( prev_neighbor - *prev_neighbor + 1 ) = *( block->skipfield + pos + length - 1 ) =
+            *prev_neighbor + length;
           // update left
-          const auto index                          = index_at( block, pos - 1 );
-          std::construct_at( as_address<Payload>( block->element, pos + length - 1 ), index );
+          const auto index = ( block->element + pos - 1 )->index;
+          std::construct_at( std::to_address( block->element ) + pos + length - 1, index );
           if ( index.prev != Index::npos )
-            index_at( block, index.prev ).next = pos + length - 1;
+            ( block->element + index.prev )->index.next = pos + length - 1;
           else {
             assert( block->first_hole == pos - 1 );
             block->first_hole = pos + length - 1;
           }
           if ( index.next != Index::npos )
-            index_at( block, index.next ).prev = pos + length - 1;
+            ( block->element + index.next )->index.prev = pos;
         } else {
           // create a new hole
-          skipfield_at( block, pos ) = skipfield_at( block, pos + length - 1 ) = length;
-          std::construct_at( as_address<Payload>( block->element, pos + length - 1 ),
+          *( block->skipfield + pos ) = *( block->skipfield + pos + length - 1 ) = length;
+          std::construct_at( std::to_address( block->element ) + pos + length - 1,
                              Index { Index::npos, block->first_hole } );
-          index_at( block, block->first_hole ).prev = pos + length - 1;
-          block->first_hole                         = pos + length - 1;
+          block->first_hole = ( block->element + block->first_hole )->index.prev = pos + length - 1;
         }
       } else
         build_hole( block, pos, length );
     }
     /// @brief Add a new hole that does not have any forward holes.
-    NEST_FORCEINLINE static void add_prefix_hole( Chunk block, Skipfield pos, Skipfield length ) noexcept
+    NEST_FORCEINLINE static constexpr void add_prefix_hole( Chunk block,
+                                                            Skipfield pos,
+                                                            Skipfield length ) noexcept
     {
       assert( pos + length - 1 != Index::npos );
       if ( block->first_hole != Index::npos ) {
-        const auto next_neighbor = address_at<Skipfield>( block->skipfield, pos + length );
-        if ( as_skipfield( next_neighbor ) > 0 ) {
+        const auto next_neighbor = block->skipfield + pos + length;
+        if ( *next_neighbor > 0 )
           // merge right
-          skipfield_at( block, pos ) =
-            skipfield_at( block, pos + length + as_skipfield( next_neighbor ) - 1 ) =
-              as_skipfield( next_neighbor ) + length;
-        } else {
+          *( block->skipfield + pos ) = *( next_neighbor + *next_neighbor - 1 ) = *next_neighbor + length;
+        else {
           // create a new hole
-          skipfield_at( block, pos ) = skipfield_at( block, pos + length - 1 ) = length;
-          std::construct_at( as_address<Payload>( block->element, pos + length - 1 ),
+          *( block->skipfield + pos ) = *( block->skipfield + pos + length - 1 ) = length;
+          std::construct_at( std::to_address( block->element ) + pos + length - 1,
                              Index { Index::npos, block->first_hole } );
-          index_at( block, block->first_hole ).prev = pos + length - 1;
-          block->first_hole                         = pos + length - 1;
+          block->first_hole = ( block->element + block->first_hole )->index.prev = pos + length - 1;
         }
       } else
         build_hole( block, pos, length );
@@ -2224,23 +2103,57 @@ namespace nest {
 
     static constexpr Chunk allocate( BlockAlloc& block_alloc, AreaAlloc& area_alloc, size_type cap )
     {
-      const auto scheme  = typename Layout::scheme_type { cap, cap + 1u };
+      const typename Layout::scheme_type scheme { cap, cap + 1u };
+      // Since the Entry contains a Index type aligned with the Skipfield,
+      // padding is always zero under any circumstances.
+      assert( Layout::split( scheme ).front() == cap * sizeof( Entry ) );
       const auto element = Layout::allocate( area_alloc, scheme );
       return details::utils::attempt(
         [&] {
           auto block = std::allocator_traits<BlockAlloc>::allocate( block_alloc, 1 );
           std::allocator_traits<BlockAlloc>::construct( block_alloc, std::to_address( block ) );
-          block->element   = details::utils::pointer_cast<Area>( element );
-          block->skipfield = block->element + Layout::split( scheme ).front();
-          // Since the Payload contains a Gap type aligned with the Skipfield,
-          // padding is always zero under any circumstances.
-          assert( Layout::split( scheme ).front() == cap * sizeof( Payload ) );
+
+          // clang-format off
+          // The standard library is quite weak when it comes to handling type conversions involving fancy pointers.
+
+          // Specifically, for performance reasons, we adopted a SoA (Structure of Arrays) layout,
+          // allocating Entry and Skipfield together.
+          // This structure requires us to first allocate a full array aligned to the maximum alignment of Tp and Skipfield,
+          // then split the memory block at appropriate offsets to obtain the starting address of the target arrays.
+
+          // However, if the pointer returned by the allocator is not a plain pointer type,
+          // pointer type conversion issues arise during the memory block splitting process.
+          // In such cases, the only viable way to perform the pointer conversion is via the pointer_traits::pointer_to function,
+          // which expects a reference to Tp (Tp&) rather than a pointer to Tp (Tp*).
+
+          // According to the type lifetime rules, we cannot dereference this pointer without an existing valid Tp object.
+          // However, since Entry's default constructor initializes the trivial Index object as the active member,
+          // and the union destructor does nothing, we can actually directly default-construct an Entry object,
+          // making the above type conversion operation valid; the same applies to Skipfield.
+
+          // This approach satisfies the requirements for pointer dereferencing, and furthermore,
+          // if different allocation strategies are employed at compile time (no longer following the SoA layout),
+          // we can additionally make all container methods except get_iterator constexpr-compliant—allowing them to execute at compile time.
+          // clang-format on
+          if constexpr ( std::is_class_v<Item> && !std::is_constructible_v<Item, Entry*> )
+            // Since mainstream fancy pointer implementations allow construction from raw pointers,
+            // we can leverage this property to eliminate unnecessary construction steps in most cases.
+            std::construct_at( details::utils::pointer_cast<Entry*>( element ) );
+          if constexpr ( std::is_class_v<Ramp> && !std::is_constructible_v<Ramp, Skipfield*> )
+            std::construct_at( reinterpret_cast<Skipfield*>(
+              details::utils::pointer_cast<std::byte*>( element ) + Layout::split( scheme ).front() ) );
+          block->element   = details::utils::pointer_cast<Item>( element );
+          block->skipfield = details::utils::pointer_cast<Ramp>(
+            details::utils::pointer_cast<typename std::pointer_traits<Ramp>::template rebind<std::byte>>(
+              element )
+            + Layout::split( scheme ).front() );
+
           // We want to always increment element_ unconditionally when the Iterator is incremented,
           // and then check for out-of-bounds,
           // which saves one conditional branch compared to the normal approach.
           // To support this operation without causing undefined behavior,
           // we must allocate an additional dummy element at the end of the skipfield array.
-          std::construct_at( details::utils::pointer_cast<Skipfield*>( block->skipfield ) + cap, 0 );
+          std::construct_at( std::to_address( block->skipfield ) + cap, 0 );
           block->capacity = static_cast<Skipfield>( cap );
           return block;
         },
@@ -2348,12 +2261,12 @@ namespace nest {
     }
 
     // Destroy the valid elements within a continuous range.
-    NEST_FORCEINLINE constexpr void purge( Accessor first, Accessor last ) noexcept
+    NEST_FORCEINLINE constexpr void purge( Entry* first, Entry* last ) noexcept
     {
       assert( first < last );
       if constexpr ( !_trivially_destructible )
         do
-          destroy( std::addressof( *( first++ ) ) );
+          destroy( std::addressof( ( first++ )->data ) );
         while ( first != last );
     }
     NEST_FORCEINLINE constexpr void purge( Tp* first, const Tp* last ) noexcept
@@ -2367,7 +2280,7 @@ namespace nest {
 
     // Destroy all elements on the block starting from iter itself.
     // This function does nothing but destroy elements.
-    NEST_FORCEINLINE Skipfield purge( iterator iter ) noexcept
+    NEST_FORCEINLINE constexpr Skipfield purge( iterator iter ) noexcept
     {
       assert( iter != iterator() );
       assert( iter.exhausted() == false );
@@ -2375,8 +2288,8 @@ namespace nest {
       if ( iter.element_ == iter.block_->element
            && ( iter.block_->occupied == iter.block_->capacity
                 || iter.block_->first_hole == iter.block_->occupied ) ) {
-        purge( Accessor::from_object( iter.block_->element ),
-               Accessor::from_address( address_at<Payload>( iter.block_->element, iter.block_->occupied ) ) );
+        purge( std::to_address( iter.block_->element ),
+               std::to_address( iter.block_->element ) + iter.block_->occupied );
         return iter.block_->occupied;
       }
       Skipfield num_dropped = 0;
@@ -2387,7 +2300,7 @@ namespace nest {
       } while ( iter.advance() );
       return num_dropped;
     }
-    NEST_FORCEINLINE Skipfield purge( iterator first, iterator last ) noexcept
+    NEST_FORCEINLINE constexpr Skipfield purge( iterator first, iterator last ) noexcept
     {
       assert( first != last );
       assert( last.exhausted() == false );
@@ -2402,7 +2315,7 @@ namespace nest {
 
     // Destroy all elements on the block starting from `first` itself.
     // This function will remove the hole when iterating, but will not recover the hole info.
-    Skipfield wipe( const_iterator first ) noexcept
+    constexpr Skipfield wipe( const_iterator first ) noexcept
     {
       assert( first != const_iterator() );
       assert( first.exhausted() == false );
@@ -2411,13 +2324,12 @@ namespace nest {
       // Manually advance the iteration, so that there will be one less skipfield read operation.
       // In fact, it can be implemented as "advance + peek previous skipfield".
       for ( auto iter = first;; ) {
-        iter.skipfield_ = address_at<Skipfield>( iter.skipfield_, 1 );
-        if ( as_skipfield( iter.skipfield_ ) > 0 ) {
-          iter.element_ = address_at<Payload>( iter.element_, as_skipfield( iter.skipfield_ ) );
-          remove_hole( iter.block_, as_index( iter.element_ ) );
-          iter.skipfield_ = address_at<Skipfield>( iter.skipfield_, as_skipfield( iter.skipfield_ ) );
+        if ( *( ++iter.skipfield_ ) > 0 ) {
+          iter.element_ += *iter.skipfield_;
+          remove_hole( iter.block_, iter.element_->index );
+          iter.skipfield_ += *iter.skipfield_;
         }
-        iter.element_ = address_at<Payload>( iter.element_, 1 );
+        ++iter.element_;
         if ( iter.exhausted() )
           break;
         destroy( std::addressof( iter.mut() ) );
@@ -2429,20 +2341,19 @@ namespace nest {
     }
     // Destroy all valid elements within [first, last), the iterator must point to a same block.
     // This function will remove the hole when iterating, but will not recover the hole info.
-    Skipfield wipe( const_iterator first, const_iterator last ) noexcept
+    constexpr Skipfield wipe( const_iterator first, const_iterator last ) noexcept
     {
       assert( first != last );
       assert( first.block_ == last.block_ );
       destroy( std::addressof( first.mut() ) );
       Skipfield num_deleted = 1;
       for ( auto iter = first;; ) {
-        iter.skipfield_ = address_at<Skipfield>( iter.skipfield_, 1 );
-        if ( as_skipfield( iter.skipfield_ ) > 0 ) {
-          iter.element_ = address_at<Payload>( iter.element_, as_skipfield( iter.skipfield_ ) );
-          remove_hole( iter.block_, as_index( iter.element_ ) );
-          iter.skipfield_ = address_at<Skipfield>( iter.skipfield_, as_skipfield( iter.skipfield_ ) );
+        if ( *( ++iter.skipfield_ ) > 0 ) {
+          iter.element_ += *iter.skipfield_;
+          remove_hole( iter.block_, iter.element_->index );
+          iter.skipfield_ += *iter.skipfield_;
         }
-        iter.element_ = address_at<Payload>( iter.element_, 1 );
+        ++iter.element_;
         if ( iter == last )
           break;
         destroy( std::addressof( iter.mut() ) );
@@ -2454,7 +2365,7 @@ namespace nest {
 
     // Destroy all elements on the block starting from `first` itself.
     // This function will update everything about the hole info.
-    NEST_FORCEINLINE Skipfield remove( const_iterator first ) noexcept
+    NEST_FORCEINLINE constexpr Skipfield remove( const_iterator first ) noexcept
     {
       const auto num_deleted = wipe( first );
       if ( first.block_->occupied > 0 )
@@ -2467,7 +2378,7 @@ namespace nest {
     }
     // Destroy all valid elements within [first, last), the iterator must point to a same block.
     // This function will update everything about the hole info.
-    NEST_FORCEINLINE Skipfield remove( const_iterator first, const_iterator last ) noexcept
+    NEST_FORCEINLINE constexpr Skipfield remove( const_iterator first, const_iterator last ) noexcept
     {
       const auto num_deleted = wipe( first, last );
       if ( first.block_->occupied > 0 )
@@ -2478,7 +2389,7 @@ namespace nest {
     }
     // Destroy all the content in the block.
     // This function will delete the entire hole linked list.
-    NEST_FORCEINLINE Skipfield remove( Chunk block ) noexcept
+    NEST_FORCEINLINE constexpr Skipfield remove( Chunk block ) noexcept
     {
       assert( block->occupied > 0 );
       purge( iterator::start_of( block ) );
@@ -2487,7 +2398,7 @@ namespace nest {
     }
 
     // Eliminate all the elements and blocks in the list.
-    size_type eliminate( BlockAlloc& block_alloc, AreaAlloc& area_alloc, Chunk& busy ) noexcept
+    constexpr size_type eliminate( BlockAlloc& block_alloc, AreaAlloc& area_alloc, Chunk& busy ) noexcept
     {
       assert( busy != nullptr );
       size_type num_eliminated = 0;
@@ -2502,8 +2413,8 @@ namespace nest {
     // Relocate the element from `src` to `dst`, the number of relocated elements will not exceed `limits`.
     // This function will not advance the `src` to the next block.
     template<typename U, bool Const>
-    U* relocate( U* dst, Iterator<Const>& src, Skipfield limits )
-    { // Currently, U is either Payload or Tp.
+    constexpr U* relocate( U* dst, Iterator<Const>& src, Skipfield limits )
+    { // Currently, U is either Entry or Tp.
       using Category = std::conditional_t<Const, const Tp&, Tp&&>;
       assert( src != Iterator<Const>() );
       assert( src.exhausted() == false );
@@ -2511,26 +2422,27 @@ namespace nest {
       assert( limits > 0 );
       details::utils::attempt(
         [&] {
-          if constexpr ( sizeof( U ) == sizeof( Payload ) // Payload is an union
+          if constexpr ( sizeof( U ) == sizeof( Entry ) // Entry is an union
                          && details::traits::AllocatorTriviallyConstructible<Alloc, Tp, Category>
                          && std::is_trivially_copyable_v<Tp> ) {
             // If there are optimization opportunities, then adopt block-based iteration.
             do {
               if ( const auto visible_len = (std::min<size_type>)( limits, src.rest() );
-                   ( src.element_ == src.block_->element
-                     && ( src.block_->occupied == src.block_->capacity
-                          || src.block_->first_hole == src.block_->occupied ) )
-                   || details::utils::all_zero( std::span(
-                     details::utils::launder_as<const Skipfield>( src.skipfield_ ),
-                     details::utils::pointer_cast<const Skipfield*>( src.skipfield_ ) + visible_len ) ) ) {
+                   !std::is_constant_evaluated()
+                   && ( ( src.element_ == src.block_->element
+                          && ( src.block_->occupied == src.block_->capacity
+                               || src.block_->first_hole == src.block_->occupied ) )
+                        || details::utils::all_zero(
+                          std::span( std::to_address( src.skipfield_ ),
+                                     std::to_address( src.skipfield_ ) + visible_len ) ) ) ) {
                 // A trivially-copyable range can be bulk-copied only when the visible portion
                 // contains no erased slots.
                 // At the beginning of a block we can establish this from the block's occupancy metadata;
                 // otherwise the skipfield must be zero throughout the visible range.
                 const auto num_copied = (std::min<size_type>)( src.block_->occupied, visible_len );
                 std::memcpy( static_cast<void*>( dst ),
-                             details::utils::pointer_cast<void*>( src.element_ ),
-                             num_copied * sizeof( Payload ) );
+                             details::utils::pointer_cast<const void*>( src.element_ ),
+                             num_copied * sizeof( Entry ) );
                 dst += num_copied;
                 limits -= visible_len;
                 if ( !src.advance( visible_len ) )
@@ -2553,10 +2465,11 @@ namespace nest {
                 } while ( limits > 0 );
             } while ( limits > 0 && !src.exhausted() );
           } else
+            // clang-format off
             // For types that are not trivially copyable,
-            // here is no difference between manually looping and invoking `std::uninitialized_*`
-            // functions, as both approaches ultimately call placement new (if the allocator does not
-            // provide a construct function).
+            // here is no difference between manually looping and invoking `std::uninitialized_*` functions,
+            // as both approaches ultimately call placement new (if the allocator does not provide a construct function).
+            // clang-format on
             do {
               if constexpr ( Const )
                 std::allocator_traits<Alloc>::construct( this->allocator(), dst, *src );
@@ -2572,24 +2485,20 @@ namespace nest {
             } while ( --limits > 0 );
         },
         [&, origin = dst] {
-          if ( origin != dst ) {
-            if constexpr ( std::is_same_v<U, Payload> )
-              purge( Accessor( std::launder( origin ) ), dst );
-            else
-              purge( std::launder( origin ), dst );
-          }
+          if ( origin != dst )
+            purge( origin, dst );
         } );
       return dst;
     }
     template<typename U, bool Const>
-    U* relocate( U* dest, Iterator<Const>&& src, Skipfield limits )
+    constexpr U* relocate( U* dest, Iterator<Const>&& src, Skipfield limits )
     { return relocate( dest, src, limits ); }
 
     // Transfer the elements on the block pointed to by `src` to the block pointed to by dest.
     // When an exception is thrown, this method will not attempt to destruct the already completed elements,
     // but will ensure the integrity of the target block.
     template<std::derived_from<Filler> Output, bool Const>
-    Skipfield transfer( Output& dst, Iterator<Const>& src )
+    constexpr Skipfield transfer( Output& dst, Iterator<Const>& src )
     {
       assert( dst.block_ != src.block_ );
       assert( dst.block_->occupied < dst.block_->capacity );
@@ -2598,13 +2507,15 @@ namespace nest {
       return details::utils::ensure(
         [&] {
           do {
-            const auto target          = details::utils::pointer_cast<Payload*>( dst.element_ );
-            const auto skipfield       = dst.skipfield_;
+            const auto target          = std::to_address( dst.element_ );
             const auto tail            = relocate( target, src, dst.rest() );
             const auto num_constructed = tail - target;
-            std::memset( details::utils::pointer_cast<void*>( skipfield ),
-                         0,
-                         num_constructed * sizeof( Skipfield ) );
+            if ( std::is_constant_evaluated() )
+              std::fill( dst.skipfield_, dst.skipfield_ + num_constructed, 0u );
+            else
+              std::memset( details::utils::pointer_cast<void*>( dst.skipfield_ ),
+                           0,
+                           num_constructed * sizeof( Skipfield ) );
             total_relocated += num_constructed;
             if ( !dst.advance( num_constructed ) )
               break;
@@ -2622,14 +2533,14 @@ namespace nest {
         } );
     }
     template<bool Const>
-    Skipfield transfer( std::derived_from<Filler> auto& dest, Iterator<Const>&& src )
+    constexpr Skipfield transfer( std::derived_from<Filler> auto& dest, Iterator<Const>&& src )
     { return transfer( dest, src ); }
 
     /// @brief Due to the operation sequence, if there is a hollow block, it must be the first block of List.
     ///        And there is only one hollow block in the List.
     /// @return (List, total_size)
     template<bool Const>
-    std::pair<Chunk, size_type> migrate( Chunk& idle, Iterator<Const>& source )
+    constexpr std::pair<Chunk, size_type> migrate( Chunk& idle, Iterator<Const>& source )
     {
       size_type num_transferred = 0;
       Chunk list                = nullptr;
@@ -2638,7 +2549,7 @@ namespace nest {
         [&] {
           while ( true ) {
             while ( true ) {
-              const auto target          = details::utils::pointer_cast<Payload*>( hole.element_ );
+              const auto target          = std::to_address( hole.element_ );
               const auto next_dest       = relocate( target, source, hole.rest() );
               const auto num_constructed = static_cast<Skipfield>( next_dest - target );
               num_transferred += num_constructed;
@@ -2646,22 +2557,28 @@ namespace nest {
               const auto exhausted = source.exhausted() && !source.next();
               if ( !hole.advance( num_constructed ) || exhausted )
                 break;
-              assert( details::utils::pointer_cast<Payload*>( hole.element_ ) == next_dest );
+              assert( std::to_address( hole.element_ ) == next_dest );
             }
 
             if ( hole.block_->occupied == hole.block_->capacity ) {
-              std::memset( details::utils::pointer_cast<void*>( hole.block_->skipfield ),
-                           0,
-                           hole.block_->capacity * sizeof( Skipfield ) );
+              if ( std::is_constant_evaluated() )
+                std::fill( hole.block_->skipfield, hole.block_->skipfield + hole.block_->capacity, 0u );
+              else
+                std::memset( details::utils::pointer_cast<void*>( hole.block_->skipfield ),
+                             0,
+                             hole.block_->capacity * sizeof( Skipfield ) );
               attach( list, detach( idle ) );
               if ( idle == nullptr )
                 break;
               hole = Filler::from( idle );
             } else if ( source.exhausted() ) {
               assert( hole.block_->occupied < hole.block_->capacity );
-              std::memset( details::utils::pointer_cast<void*>( hole.block_->skipfield ),
-                           0,
-                           hole.skipfield_ - hole.block_->skipfield );
+              if ( std::is_constant_evaluated() )
+                std::fill( hole.block_->skipfield, hole.skipfield_, 0u );
+              else
+                std::memset( details::utils::pointer_cast<void*>( hole.block_->skipfield ),
+                             0,
+                             hole.offset() * sizeof( Skipfield ) );
               build_hole( hole.block_, hole.offset(), hole.block_->capacity - hole.offset() );
               attach( list, detach( idle ) );
               break;
@@ -2671,7 +2588,7 @@ namespace nest {
         [&, origin = source] {
           // Revert the modifications to form a complete transaction.
           if ( hole.block_->occupied > 0 )
-            purge( Accessor::from_object( hole.block_->element ), Accessor::from_address( hole.element_ ) );
+            purge( std::to_address( hole.block_->element ), std::to_address( hole.element_ ) );
           source = origin;
           while ( list != nullptr ) {
             purge( iterator::start_of( list ) );
@@ -2685,11 +2602,11 @@ namespace nest {
     /// @brief Reconstruct all the blocks from the source.
     /// @return See `transfer_to`.
     template<bool Const>
-    std::pair<Chunk, size_type> rebuild_from( BlockAlloc& block_alloc,
-                                              AreaAlloc& area_alloc,
-                                              Iterator<Const> source,
-                                              size_type total_size,
-                                              HiveLimits limits )
+    constexpr std::pair<Chunk, size_type> rebuild_from( BlockAlloc& block_alloc,
+                                                        AreaAlloc& area_alloc,
+                                                        Iterator<Const> source,
+                                                        size_type total_size,
+                                                        HiveLimits limits )
     {
       auto [blanks, total_capacity] = reserve_for( block_alloc, area_alloc, total_size, limits );
       return details::utils::attempt(
@@ -2705,7 +2622,7 @@ namespace nest {
     }
 
     template<std::input_iterator Iter>
-    void fill_with( Payload* dest, Iter& src, Skipfield count )
+    void fill_with( Entry* dest, Iter& src, Skipfield count )
     {
       if constexpr ( _trivially_constructible_v<std::iter_reference_t<Iter>> ) {
         std::uninitialized_copy_n( src, count, dest );
@@ -2723,11 +2640,11 @@ namespace nest {
           },
           [&, origin = dest] {
             if ( num_constructed > 0 )
-              purge( Accessor::from_object( origin ), Accessor( dest ) );
+              purge( std::to_address( origin ), dest );
           } );
       }
     }
-    void fill_with( Payload* dest, const Tp& value, Skipfield count )
+    void fill_with( Entry* dest, const Tp& value, Skipfield count )
     {
       if constexpr ( _trivially_constructible_v<const Tp&> )
         std::uninitialized_fill_n( dest, count, value );
@@ -2743,7 +2660,7 @@ namespace nest {
           },
           [&, origin = dest] {
             if ( num_constructed > 0 )
-              purge( Accessor::from_object( origin ), Accessor( dest ) );
+              purge( std::to_address( origin ), dest );
           } );
       }
     }
@@ -2751,7 +2668,7 @@ namespace nest {
     // Convert an empty block into a hollow block.
     template<typename... Args>
       requires std::is_constructible_v<Tp, Args...>
-    NEST_FORCEINLINE iterator fill_blank( Chunk blank, Args&&... args )
+    NEST_FORCEINLINE constexpr iterator fill_blank( Chunk blank, Args&&... args )
     {
       assert( blank->occupied == 0 );
       assert( blank->capacity >= 1 );
@@ -2768,7 +2685,7 @@ namespace nest {
       assert( count > 0 );
       assert( blank->occupied == 0 );
       assert( count <= blank->capacity );
-      fill_with( details::utils::pointer_cast<Payload*>( blank->element ), iter, count );
+      fill_with( std::to_address( blank->element ), iter, count );
       std::memset( details::utils::pointer_cast<void*>( blank->skipfield ), 0, count * sizeof( Skipfield ) );
       blank->occupied = count;
       if ( count < blank->capacity )
@@ -2780,7 +2697,7 @@ namespace nest {
       assert( count > 0 );
       assert( blank->occupied == 0 );
       assert( count <= blank->capacity );
-      fill_with( details::utils::pointer_cast<Payload*>( blank->element ), value, count );
+      fill_with( std::to_address( blank->element ), value, count );
       std::memset( details::utils::pointer_cast<void*>( blank->skipfield ), 0, count * sizeof( Skipfield ) );
       blank->occupied = static_cast<Skipfield>( count );
       if ( count < blank->capacity )
@@ -2790,7 +2707,7 @@ namespace nest {
     // Rebuild the current hive from `cursor`, `*this` must be empty.
     // This function will first consider reusing the existing idle blocks.
     template<bool Const>
-    void fill_from( Iterator<Const> cursor, size_type total_size )
+    constexpr void fill_from( Iterator<Const> cursor, size_type total_size )
     {
       assert( empty() == true );
       if ( vacuum_ != nullptr ) {
@@ -2828,7 +2745,7 @@ namespace nest {
         auto hole = Muncher::from( hollow_ );
         while ( true ) {
           const auto num_constructed = (std::min<size_type>)( hole.rest(), count );
-          fill_with( details::utils::pointer_cast<Payload*>( hole.element_ ), source, num_constructed );
+          fill_with( std::to_address( hole.element_ ), source, num_constructed );
           std::memset( details::utils::pointer_cast<void*>( hole.block_->skipfield ),
                        0,
                        num_constructed * sizeof( Skipfield ) );
@@ -2878,7 +2795,7 @@ namespace nest {
           return;
     }
     template<std::input_iterator First>
-    void introduce( First first, std::sentinel_for<First> auto sentinel )
+    constexpr void introduce( First first, std::sentinel_for<First> auto sentinel )
     {
       // bulk insertion to avoid repeatedly rebuilding the index
       if ( hollow_ != nullptr ) {
@@ -2956,7 +2873,7 @@ namespace nest {
     }
 
     template<typename Comp>
-    void direct_sort( Tp* buffer, Comp&& comp )
+    constexpr void direct_sort( Tp* buffer, Comp&& comp )
     {
       auto tail = buffer; // used to mark the destruction zone
       details::utils::attempt(
@@ -2965,7 +2882,7 @@ namespace nest {
           do
             tail = relocate( tail, iter, occupied_ );
           while ( tail < buffer + occupied_ );
-          assert( tail == std::to_address( buffer ) + occupied_ );
+          assert( tail == buffer + occupied_ );
           std::ranges::sort( buffer, buffer + occupied_, std::forward<Comp>( comp ) );
 
           iter = begin();
@@ -2993,7 +2910,7 @@ namespace nest {
         } );
     }
     template<typename Comp>
-    void indirect_sort( Tp** buffer, size_type* mapping, Comp&& comp )
+    constexpr void indirect_sort( Tp** buffer, size_type* mapping, Comp&& comp )
     {
       // used to mark the destruction zone of size_type (in case the size_type is not a scalar type)
       auto tail = mapping;
@@ -3041,7 +2958,7 @@ namespace nest {
       swap( next_capacity_, other.next_capacity_ );
     }
 
-    size_type _erase_if( auto&& pred )
+    constexpr size_type _erase_if( auto&& pred )
     {
       if ( empty() )
         return 0;
@@ -3096,7 +3013,7 @@ namespace nest {
       }
       return total_erased;
     }
-    size_type _erase( const Tp& value )
+    constexpr size_type _erase( const Tp& value )
     {
       return _erase_if( [&]( const auto& ele ) { return ele == value; } );
     }
