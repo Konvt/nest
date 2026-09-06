@@ -98,8 +98,6 @@ namespace nest {
        *   a valid object of `std::pointer_traits<To>::element_type`, unless that
        *   type is `std::byte`, `char`, or `unsigned char`; otherwise, the behavior
        *   is undefined.
-       *
-       * * In any case, `ptr` shall not be equal to `nullptr`.
        */
       template<typename To, typename From>
         requires( !std::is_convertible_v<From, To> )
@@ -109,7 +107,8 @@ namespace nest {
         static_assert( !std::is_void_v<std::remove_pointer_t<std::decay_t<From>>>,
                        "pointer_cast cannot understand the actual target of a void pointer" );
         using Target = std::pointer_traits<To>::element_type;
-        assert( ptr != nullptr );
+        if ( ptr == nullptr ) [[unlikely]]
+          return static_cast<To>( nullptr );
         // The std::convertible_to will also require implicit conversion,
         // but it's too strict.
         if constexpr ( requires { static_cast<To>( ptr ); } )
@@ -2101,7 +2100,7 @@ namespace nest {
       assert( pos + length - 1 != Index::npos );
       if ( block->first_hole != Index::npos ) {
         // Pointers that are out of range but will not be dereferenced are safe.
-        const auto prev_neighbor = address_at<Skipfield>( block->skipfield, pos - 1u );
+        const auto prev_neighbor = pos > 0 ? address_at<Skipfield>( block->skipfield, pos - 1 ) : nullptr;
         // Note that allocate allocates an extra element at the end of the Skipfield array,
         // so dereferencing this pointer is always safe.
         const auto next_neighbor = address_at<Skipfield>( block->skipfield, pos + length );
@@ -2148,7 +2147,7 @@ namespace nest {
     {
       assert( pos + length - 1 != Index::npos );
       if ( block->first_hole != Index::npos ) {
-        const auto prev_neighbor = address_at<Skipfield>( block->skipfield, pos - 1u );
+        const auto prev_neighbor = pos > 0 ? address_at<Skipfield>( block->skipfield, pos - 1 ) : nullptr;
         if ( pos > 0 && as_skipfield( prev_neighbor ) > 0 ) {
           // merge left
           skipfield_at( block, pos - as_skipfield( prev_neighbor ) ) =
