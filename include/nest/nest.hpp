@@ -569,8 +569,10 @@ namespace nest {
 
       constexpr Iterator& operator++() noexcept
       {
-        if ( !advance() )
+        if ( !advance() ) [[likely]]
           next();
+        else
+          *this = sentinel_of( block_ );
         return *this;
       }
       constexpr Iterator operator++( int ) noexcept
@@ -607,19 +609,113 @@ namespace nest {
         return copy;
       }
 
-      friend constexpr bool operator==( const Iterator& a, const Iterator& b ) noexcept
+      [[nodiscard]] friend constexpr bool operator==( const Iterator& a, const Iterator& b ) noexcept
       { return a.element_ == b.element_; }
-      friend constexpr bool operator!=( const Iterator& a, const Iterator& b ) noexcept
+      [[nodiscard]] friend constexpr bool operator!=( const Iterator& a, const Iterator& b ) noexcept
       { return !( a == b ); }
-      friend constexpr bool operator==( const Iterator& a, const Iterator<!Const>& b ) noexcept
+      [[nodiscard]] friend constexpr bool operator==( const Iterator& a, const Iterator<!Const>& b ) noexcept
       { return a.element_ == b.element_; }
-      friend constexpr bool operator!=( const Iterator& a, const Iterator<!Const>& b ) noexcept
+      [[nodiscard]] friend constexpr bool operator!=( const Iterator& a, const Iterator<!Const>& b ) noexcept
       { return !( a == b ); }
 
       // to support conversion
-      NEST_FORCEINLINE constexpr operator Iterator<true>() const noexcept
+      [[nodiscard]] NEST_FORCEINLINE constexpr operator Iterator<true>() const noexcept
         requires( !Const )
       { return { element_, skipfield_, block_ }; }
+
+      [[nodiscard]] NEST_FORCEINLINE friend constexpr Iterator next( Iterator iter ) noexcept
+      { return ++iter; }
+      [[nodiscard]] NEST_FORCEINLINE friend constexpr Iterator prev( Iterator iter ) noexcept
+      { return --iter; }
+
+      [[nodiscard]] NEST_FORCEINLINE friend constexpr Iterator next( Iterator iter,
+                                                                     difference_type dist ) noexcept
+      {
+        using std::advance;
+        advance( iter, dist );
+        return iter;
+      }
+      [[nodiscard]] friend constexpr Iterator prev( Iterator iter, difference_type dist ) noexcept
+      {
+        if ( dist == 0 ) [[unlikely]]
+          return;
+
+        if ( dist > 0 ) {
+          if ( iter.block_->occupied < dist ) {
+            auto block = iter.block_;
+            do
+              --dist;
+            while ( ( --iter ).block_ == block );
+
+            while ( true ) {
+              dist -= block->occupied;
+              block = block->prev;
+              // detect the tail node of the linked list
+              assert( block->next != nullptr );
+              if ( block->occupied > dist ) {
+                iter = start_of( block );
+                break;
+              }
+            }
+          }
+          return std::prev( iter, dist );
+        } else {
+          using std::next;
+          return next( iter, dist );
+        }
+      }
+      friend constexpr void advance( Iterator& iter, auto dist ) noexcept
+      {
+        auto step = static_cast<difference_type>( dist );
+        if ( step == 0 ) [[unlikely]]
+          return;
+
+        if ( step > 0 ) {
+          if ( iter.block_->occupied < step ) {
+            do
+              --step;
+            while ( iter.advance() );
+
+            auto block = iter.block_;
+            while ( true ) {
+              step -= block->occupied;
+              block = block->next;
+              assert( block != nullptr );
+              if ( block->occupied > step ) {
+                iter = start_of( block );
+                break;
+              }
+            }
+          }
+          return std::advance( iter, step );
+        } else {
+          using std::prev;
+          iter = prev( iter, -step );
+        }
+      }
+
+      [[nodiscard]] friend constexpr difference_type distance( Iterator first, Iterator last ) noexcept
+      { // We assume that the location of `first` is always ahead of the `last`.
+        if ( first.block_ == last.block_ )
+          return std::distance( first, last );
+
+        difference_type dist = 0;
+        do
+          ++dist; // step to the sentinel
+        while ( first.advance() );
+        first.next();
+
+        if ( first.block_ != last.block_ ) {
+          auto block = first.block_;
+          do {
+            dist += block->occupied;
+            block = block->next;
+            assert( block != nullptr );
+          } while ( block != last.block_ );
+        }
+
+        return std::distance( first, last ) + dist;
+      }
     };
 
     // An iterator used to traverse empty blocks.
@@ -987,7 +1083,7 @@ namespace nest {
       clear();
       insert( count, value );
     }
-    template<typename InputIt>
+    template<std::input_iterator InputIt>
     void assign( InputIt first, InputIt last )
     {
       clear();
