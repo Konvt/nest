@@ -182,7 +182,12 @@ namespace nest {
 
       template<typename Alloc>
       class AllocatorCell {
-        [[no_unique_address]] Alloc alloc_;
+#if defined( _MSC_VER )
+        [[msvc::no_unique_address]]
+#else
+        [[no_unique_address]]
+#endif
+        Alloc alloc_;
 
         static constexpr bool _is_pocca =
           std::allocator_traits<Alloc>::propagate_on_container_copy_assignment::value;
