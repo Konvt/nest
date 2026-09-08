@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cassert>
 #include <cstddef>
 #include <cstring>
@@ -226,11 +227,10 @@ namespace nest {
         NEST_FORCEINLINE constexpr void pocs( Alloc& alloc )
           noexcept( !_is_pocs || std::is_nothrow_swappable_v<Alloc> )
         {
-          using std::swap;
           // Calling swap is UB when the allocator does not satisfy POCS and the allocators are not equal.
           assert( _is_pocs || alloc_ == alloc );
           if constexpr ( _is_pocs )
-            swap( alloc_, alloc );
+            std::ranges::swap( alloc_, alloc );
         }
 
         NEST_FORCEINLINE constexpr Alloc& allocator() & noexcept { return alloc_; }
@@ -1492,8 +1492,7 @@ namespace nest {
         assert( head_ != nullptr );
         auto [list, total_capacity] =
           rebuild_from( block_alloc, area_alloc, begin(), occupied_, block_limits );
-        using std::swap;
-        swap( head_, list );
+        std::ranges::swap( head_, list );
         hollow_ = nullptr;
         if ( head_->occupied < head_->capacity )
           add_hollow( hollow_, head_ );
@@ -1734,41 +1733,58 @@ namespace nest {
             [&] { std::allocator_traits<Alloc>::deallocate( this->allocator(), allocated, occupied_ ); } );
         }
       } else {
-        if constexpr ( alignof( Tp* ) <= Layout::alignment && alignof( size_type ) <= Layout::alignment ) {
-          auto addresses = borrow_from( vacuum_, occupied_ * sizeof( Tp* ) );
-          auto mapping   = borrow_from( vacuum_, occupied_ * sizeof( size_type ) );
-          if ( mapping != nullptr && mapping == addresses )
-            mapping = borrow_from( mapping->next, occupied_ * sizeof( size_type ) );
-          if ( addresses != nullptr && mapping != nullptr ) {
-            indirect_sort( details::utils::pointer_cast<Tp**>( addresses->element ),
-                           details::utils::pointer_cast<size_type*>( mapping->element ),
-                           std::move( comp ) );
-            return;
+        const auto dispatch_to = [&]<typename Ordinal>( std::type_identity<Ordinal> ) {
+          if constexpr ( alignof( Tp* ) <= Layout::alignment && alignof( Ordinal ) <= Layout::alignment ) {
+            auto addresses = borrow_from( vacuum_, occupied_ * sizeof( Tp* ) );
+            auto mapping   = borrow_from( vacuum_, occupied_ * sizeof( Ordinal ) );
+            if ( mapping != nullptr && mapping == addresses )
+              mapping = borrow_from( mapping->next, occupied_ * sizeof( Ordinal ) );
+            if ( addresses != nullptr && mapping != nullptr ) {
+              indirect_sort( details::utils::pointer_cast<Tp**>( addresses->element ),
+                             details::utils::pointer_cast<Ordinal*>( mapping->element ),
+                             std::move( comp ) );
+              return;
+            }
           }
-        }
-        using BufferLayout = details::utils::SoALayout<Tp*, size_type>;
-        if constexpr ( BufferLayout::alignment <= Layout::alignment ) {
-          // If we cannot find two small memory blocks but can find one sufficiently large, use it.
-          auto borrowed = borrow_from( vacuum_, BufferLayout::allocation( occupied_ ) );
-          if ( borrowed != nullptr ) {
-            indirect_sort( details::utils::pointer_cast<Tp**>( borrowed->element ),
-                           details::utils::pointer_cast<size_type*>(
-                             borrowed->element + BufferLayout::split( occupied_ ).front() ),
-                           std::move( comp ) );
-            return;
+          using BufferLayout = details::utils::SoALayout<Tp*, Ordinal>;
+          if constexpr ( BufferLayout::alignment <= Layout::alignment ) {
+            // If we cannot find two small memory blocks but can find one sufficiently large, use it.
+            auto borrowed = borrow_from( vacuum_, BufferLayout::allocation( occupied_ ) );
+            if ( borrowed != nullptr ) {
+              indirect_sort( details::utils::pointer_cast<Tp**>( borrowed->element ),
+                             details::utils::pointer_cast<Ordinal*>(
+                               borrowed->element + BufferLayout::split( occupied_ ).front() ),
+                             std::move( comp ) );
+              return;
+            }
           }
-        }
-        using BufferAlloc = BufferLayout::template rebind_alloc<Alloc>;
-        BufferAlloc buffer_alloc { this->allocator() };
-        const auto allocated = BufferLayout::allocate( buffer_alloc, occupied_ );
-        details::utils::ensure(
-          [&] {
-            indirect_sort( details::utils::pointer_cast<Tp**>( allocated ),
-                           reinterpret_cast<size_type*>( details::utils::pointer_cast<std::byte*>( allocated )
+          using BufferAlloc = BufferLayout::template rebind_alloc<Alloc>;
+          BufferAlloc buffer_alloc { this->allocator() };
+          const auto allocated = BufferLayout::allocate( buffer_alloc, occupied_ );
+          details::utils::ensure(
+            [&] {
+              indirect_sort( details::utils::pointer_cast<Tp**>( allocated ),
+                             reinterpret_cast<Ordinal*>( details::utils::pointer_cast<std::byte*>( allocated )
                                                          + BufferLayout::split( occupied_ ).front() ),
-                           std::move( comp ) );
-          },
-          [&] { BufferLayout::deallocate( buffer_alloc, allocated, occupied_ ); } );
+                             std::move( comp ) );
+            },
+            [&] { BufferLayout::deallocate( buffer_alloc, allocated, occupied_ ); } );
+        };
+
+        const unsigned bits = std::bit_width( occupied_ );
+        if ( bits <= 8 )
+          return dispatch_to( std::type_identity<std::uint8_t>() );
+        else if ( bits <= 16 )
+          return dispatch_to( std::type_identity<std::uint16_t>() );
+        else if ( bits <= 32 )
+          return dispatch_to( std::type_identity<std::uint32_t>() );
+        else if ( bits <= 64 )
+          return dispatch_to( std::type_identity<std::uint64_t>() );
+        else [[unlikely]]
+          // Under normal circumstances, this branch will never be hit;
+          // it's written here for some compatibility considerations,
+          // since the standard doesn't explicitly state that an allocator's size_type must be a scalar type.
+          return dispatch_to( std::type_identity<size_type>() );
       }
     }
 
@@ -1998,8 +2014,7 @@ namespace nest {
       assert( other->prev != nullptr );
       if ( list != nullptr ) {
         list->prev->next = other;
-        using std::swap;
-        swap( list->prev, other->prev );
+        std::ranges::swap( list->prev, other->prev );
       } else
         list = other;
     }
@@ -3010,8 +3025,8 @@ namespace nest {
             purge( origin, tail );
         } );
     }
-    template<typename Comp>
-    constexpr void indirect_sort( Tp** buffer, size_type* mapping, Comp&& comp )
+    template<typename Ordinal, typename Comp>
+    constexpr void indirect_sort( Tp** buffer, Ordinal* mapping, Comp&& comp )
     {
       // used to mark the destruction zone of size_type (in case the size_type is not a scalar type)
       auto tail = mapping;
@@ -3032,15 +3047,14 @@ namespace nest {
           count = 0;
           do {
             while ( mapping[count] != count ) {
-              std::iter_swap( buffer[count], buffer[mapping[count]] );
-              using std::swap;
-              swap( mapping[count], mapping[mapping[count]] );
+              std::ranges::iter_swap( buffer[count], buffer[mapping[count]] );
+              std::ranges::swap( mapping[count], mapping[mapping[count]] );
             }
             ++count;
           } while ( count < occupied_ );
         },
         [&] {
-          if ( !std::is_trivially_destructible_v<size_type> )
+          if ( !std::is_trivially_destructible_v<Ordinal> )
             while ( mapping != tail )
               std::destroy_at( mapping++ );
         } );
@@ -3048,15 +3062,14 @@ namespace nest {
 
     constexpr void interchange( Hive& other )
     {
-      using std::swap;
-      swap( head_, other.head_ );
-      swap( vacuum_, other.vacuum_ );
-      swap( hollow_, other.hollow_ );
-      swap( occupied_, other.occupied_ );
-      swap( capacity_, other.capacity_ );
-      swap( max_capacity_, other.max_capacity_ );
-      swap( min_capacity_, other.min_capacity_ );
-      swap( next_capacity_, other.next_capacity_ );
+      std::ranges::swap( head_, other.head_ );
+      std::ranges::swap( vacuum_, other.vacuum_ );
+      std::ranges::swap( hollow_, other.hollow_ );
+      std::ranges::swap( occupied_, other.occupied_ );
+      std::ranges::swap( capacity_, other.capacity_ );
+      std::ranges::swap( max_capacity_, other.max_capacity_ );
+      std::ranges::swap( min_capacity_, other.min_capacity_ );
+      std::ranges::swap( next_capacity_, other.next_capacity_ );
     }
 
     constexpr size_type _erase_if( auto&& pred )
