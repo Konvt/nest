@@ -20,7 +20,6 @@
 #include <type_traits>
 #include <utility>
 
-
 #if defined( __x86_64__ ) || defined( __i386__ )
 # include <immintrin.h>
 #endif
@@ -950,7 +949,6 @@ namespace nest {
       : AllocCell( alloc )
       , max_capacity_ { static_cast<Skipfield>( block_limits.max ) }
       , min_capacity_ { static_cast<Skipfield>( block_limits.min ) }
-      , next_capacity_ { static_cast<Skipfield>( block_limits.min ) }
     { assert( min_capacity_ <= max_capacity_ ); }
     constexpr explicit Hive( const Alloc& alloc ) noexcept
       : Hive( HiveLimits( min_default_capacity(), max_default_capacity() ), alloc )
@@ -1256,9 +1254,7 @@ namespace nest {
           // allocate one
           BlockAlloc block_alloc { this->allocator() };
           AreaAlloc area_alloc { this->allocator() };
-          assert( next_capacity_ >= min_capacity_ );
-          auto blank     = allocate( block_alloc, area_alloc, next_capacity_ );
-          next_capacity_ = grow( next_capacity_ );
+          auto blank = allocate( block_alloc, area_alloc, next_capacity() );
           details::utils::attempt( [&] { result = fill_blank( blank, std::forward<Args>( args )... ); },
                                    [&] { deallocate( block_alloc, area_alloc, blank ); } );
           capacity_ += blank->capacity;
@@ -1540,18 +1536,16 @@ namespace nest {
 #endif
 
       if ( min_capacity_ >= block_limits.min && max_capacity_ <= block_limits.max ) {
-        max_capacity_  = block_limits.max;
-        min_capacity_  = block_limits.min;
-        next_capacity_ = std::clamp( next_capacity_, min_capacity_, max_capacity_ );
+        max_capacity_ = block_limits.max;
+        min_capacity_ = block_limits.min;
         return;
       }
 
       BlockAlloc block_alloc { this->allocator() };
       AreaAlloc area_alloc { this->allocator() };
       if ( min_capacity_ > block_limits.max || max_capacity_ < block_limits.min ) {
-        max_capacity_  = block_limits.max;
-        min_capacity_  = block_limits.min;
-        next_capacity_ = std::clamp( next_capacity_, min_capacity_, max_capacity_ );
+        max_capacity_ = block_limits.max;
+        min_capacity_ = block_limits.min;
         if ( vacuum_ != nullptr )
           capacity_ -= discard( block_alloc, area_alloc, vacuum_ );
         if ( occupied_ == 0 || capacity_ == 0 )
@@ -1570,9 +1564,8 @@ namespace nest {
 
       // If an exception is thrown, the specified block limit will violate the current hive limit.
       // This is what is called an "unspecified result".
-      max_capacity_  = block_limits.max;
-      min_capacity_  = block_limits.min;
-      next_capacity_ = std::clamp( next_capacity_, min_capacity_, max_capacity_ );
+      max_capacity_ = block_limits.max;
+      min_capacity_ = block_limits.min;
       if ( vacuum_ != nullptr )
         capacity_ -= discard_unfit( block_alloc, area_alloc, vacuum_, block_limits );
       if ( occupied_ == 0 || capacity_ == 0 )
@@ -1981,21 +1974,19 @@ namespace nest {
     // member variables:
 
     // `head_` is a bidirectional linked list.
-    Chunk head_              = nullptr;
+    Chunk head_             = nullptr;
     // `vacuum_` is a bidirectional linked list.
-    Chunk vacuum_            = nullptr;
+    Chunk vacuum_           = nullptr;
     // `hollow_` is a special bidirectional linked list.
-    Chunk hollow_            = nullptr;
-    size_type occupied_      = 0;
-    size_type capacity_      = 0;
-    Skipfield max_capacity_  = max_default_capacity();
-    Skipfield min_capacity_  = min_default_capacity();
-    Skipfield next_capacity_ = min_default_capacity();
+    Chunk hollow_           = nullptr;
+    size_type occupied_     = 0;
+    size_type capacity_     = 0;
+    Skipfield max_capacity_ = max_default_capacity();
+    Skipfield min_capacity_ = min_default_capacity();
 
-    NEST_FORCEINLINE constexpr Skipfield grow( size_type last_capacity ) const noexcept
+    NEST_FORCEINLINE constexpr Skipfield next_capacity() const noexcept
     { // accept size_type to prevent overflow
-      return static_cast<Skipfield>(
-        std::clamp<size_type>( last_capacity * 2, min_capacity_, max_capacity_ ) );
+      return static_cast<Skipfield>( std::clamp<size_type>( occupied_, min_capacity_, max_capacity_ ) );
     }
 
     NEST_FORCEINLINE constexpr void throw_if_violate( Skipfield min_cap, Skipfield max_cap ) const
@@ -3049,9 +3040,9 @@ namespace nest {
       BlockAlloc block_alloc { this->allocator() };
       AreaAlloc area_alloc { this->allocator() };
       do {
-        attach( vacuum_, allocate( block_alloc, area_alloc, next_capacity_ ) );
-        capacity_ += next_capacity_;
-        next_capacity_ = grow( next_capacity_ );
+        const auto new_cap = next_capacity();
+        attach( vacuum_, allocate( block_alloc, area_alloc, new_cap ) );
+        capacity_ += new_cap;
       } while ( consume( vacuum_ ) );
     }
 
@@ -3136,7 +3127,6 @@ namespace nest {
       std::ranges::swap( capacity_, other.capacity_ );
       std::ranges::swap( max_capacity_, other.max_capacity_ );
       std::ranges::swap( min_capacity_, other.min_capacity_ );
-      std::ranges::swap( next_capacity_, other.next_capacity_ );
     }
 
     constexpr size_type _erase_if( auto&& pred )
