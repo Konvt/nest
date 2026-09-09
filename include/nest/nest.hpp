@@ -19,6 +19,10 @@
 #include <type_traits>
 #include <utility>
 
+#if defined( __x86_64__ ) || defined( __i386__ )
+# include <immintrin.h>
+#endif
+
 #ifdef NEST_DEBUG
 # include <format>
 # if defined( _MSC_VER )
@@ -57,12 +61,76 @@ namespace nest {
 
     namespace utils {
       template<std::integral Integer, std::size_t Ext>
-      constexpr bool all_zero( std::span<Integer, Ext> span ) noexcept
+      constexpr bool all_zero( std::span<Integer, Ext> rg ) noexcept
       {
-        std::remove_const_t<Integer> result = 0;
-        for ( const auto num : span )
-          result |= num;
-        return result == 0;
+#if defined( __AVX512F__ ) || defined( __AVX2__ ) || defined( __SSE4_1__ )
+        if ( !std::is_constant_evaluated() ) {
+# if defined( __AVX512F__ )
+          constexpr std::size_t V = 64 / sizeof( Integer );
+# elif defined( __AVX2__ )
+          constexpr std::size_t V = 32 / sizeof( Integer );
+# else
+          constexpr std::size_t V = 16 / sizeof( Integer );
+# endif
+          constexpr std::size_t GROUP = 4 * V;
+
+          std::size_t i = 0;
+          // Probe four SIMD vectors per iteration to reduce loop overhead.
+          for ( ; i + GROUP <= rg.size(); i += GROUP ) {
+# if defined( __AVX512F__ )
+            const __m512i a = _mm512_loadu_si512( rg.data() + i );
+            const __m512i b = _mm512_loadu_si512( rg.data() + i + V );
+            const __m512i c = _mm512_loadu_si512( rg.data() + i + 2 * V );
+            const __m512i d = _mm512_loadu_si512( rg.data() + i + 3 * V );
+
+            if ( _mm512_test_epi64_mask( a, a ) || _mm512_test_epi64_mask( b, b )
+                 || _mm512_test_epi64_mask( c, c ) || _mm512_test_epi64_mask( d, d ) )
+# elif defined( __AVX2__ )
+            const __m256i a = _mm256_loadu_si256( reinterpret_cast<const __m256i*>( rg.data() + i ) );
+            const __m256i b = _mm256_loadu_si256( reinterpret_cast<const __m256i*>( rg.data() + i + V ) );
+            const __m256i c = _mm256_loadu_si256( reinterpret_cast<const __m256i*>( rg.data() + i + 2 * V ) );
+            const __m256i d = _mm256_loadu_si256( reinterpret_cast<const __m256i*>( rg.data() + i + 3 * V ) );
+
+            if ( !_mm256_testz_si256( a, a ) || !_mm256_testz_si256( b, b ) || !_mm256_testz_si256( c, c )
+                 || !_mm256_testz_si256( d, d ) )
+# else
+            const __m128i a = _mm_loadu_si128( reinterpret_cast<const __m128i*>( rg.data() + i ) );
+            const __m128i b = _mm_loadu_si128( reinterpret_cast<const __m128i*>( rg.data() + i + V ) );
+            const __m128i c = _mm_loadu_si128( reinterpret_cast<const __m128i*>( rg.data() + i + 2 * V ) );
+            const __m128i d = _mm_loadu_si128( reinterpret_cast<const __m128i*>( rg.data() + i + 3 * V ) );
+
+            if ( !_mm_testz_si128( a, a ) || !_mm_testz_si128( b, b ) || !_mm_testz_si128( c, c )
+                 || !_mm_testz_si128( d, d ) )
+# endif
+              return false;
+          }
+
+          for ( ; i + V <= rg.size(); i += V ) {
+# if defined( __AVX512F__ )
+            const __m512i v = _mm512_loadu_si512( rg.data() + i );
+            if ( _mm512_test_epi64_mask( v, v ) )
+# elif defined( __AVX2__ )
+            const __m256i v = _mm256_loadu_si256( reinterpret_cast<const __m256i*>( rg.data() + i ) );
+            if ( !_mm256_testz_si256( v, v ) )
+# else
+            const __m128i v = _mm_loadu_si128( reinterpret_cast<const __m128i*>( rg.data() + i ) );
+            if ( !_mm_testz_si128( v, v ) )
+# endif
+              return false;
+          }
+
+          while ( i < rg.size() ) {
+            if ( rg[i++] != 0 )
+              return false;
+          }
+
+          return true;
+        }
+#endif
+
+        // If SIMD is enabled, this code will be removed as it is dead code.
+        return std::ranges::all_of( rg, []( auto num ) noexcept { return num == 0; } );
+        // Actually we are waiting for `std::simd`.
       }
 
       template<typename To, typename From>
@@ -571,8 +639,6 @@ namespace nest {
       {
         if ( !advance() ) [[likely]]
           next();
-        else
-          *this = sentinel_of( block_ );
         return *this;
       }
       constexpr Iterator operator++( int ) noexcept

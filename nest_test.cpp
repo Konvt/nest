@@ -7,6 +7,7 @@
 #include <list>
 #include <numeric>
 #include <print>
+#include <vector>
 
 #if __cplusplus < 202302L
 # error "require C++23"
