@@ -9,6 +9,7 @@
 #include <bit>
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <iterator>
@@ -18,6 +19,7 @@
 #include <span>
 #include <type_traits>
 #include <utility>
+
 
 #if defined( __x86_64__ ) || defined( __i386__ )
 # include <immintrin.h>
@@ -66,13 +68,15 @@ namespace nest {
 #if defined( __AVX512F__ ) || defined( __AVX2__ ) || defined( __SSE4_1__ )
         if ( !std::is_constant_evaluated() ) {
 # if defined( __AVX512F__ )
-          constexpr std::size_t V = 64 / sizeof( Integer );
+          constexpr std::size_t V     = 64 / sizeof( Integer );
+          constexpr std::size_t GROUP = 2 * V; // after testing on Zen4 with random data
 # elif defined( __AVX2__ )
-          constexpr std::size_t V = 32 / sizeof( Integer );
-# else
-          constexpr std::size_t V = 16 / sizeof( Integer );
-# endif
+          constexpr std::size_t V     = 32 / sizeof( Integer );
           constexpr std::size_t GROUP = 4 * V;
+# else
+          constexpr std::size_t V     = 16 / sizeof( Integer );
+          constexpr std::size_t GROUP = 4 * V;
+# endif
 
           std::size_t i = 0;
           // Probe four SIMD vectors per iteration to reduce loop overhead.
@@ -80,11 +84,8 @@ namespace nest {
 # if defined( __AVX512F__ )
             const __m512i a = _mm512_loadu_si512( rg.data() + i );
             const __m512i b = _mm512_loadu_si512( rg.data() + i + V );
-            const __m512i c = _mm512_loadu_si512( rg.data() + i + 2 * V );
-            const __m512i d = _mm512_loadu_si512( rg.data() + i + 3 * V );
 
-            if ( _mm512_test_epi64_mask( a, a ) || _mm512_test_epi64_mask( b, b )
-                 || _mm512_test_epi64_mask( c, c ) || _mm512_test_epi64_mask( d, d ) )
+            if ( _mm512_test_epi64_mask( a, a ) || _mm512_test_epi64_mask( b, b ) )
 # elif defined( __AVX2__ )
             const __m256i a = _mm256_loadu_si256( reinterpret_cast<const __m256i*>( rg.data() + i ) );
             const __m256i b = _mm256_loadu_si256( reinterpret_cast<const __m256i*>( rg.data() + i + V ) );
@@ -704,7 +705,7 @@ namespace nest {
       [[nodiscard]] friend constexpr Iterator prev( Iterator iter, difference_type dist ) noexcept
       {
         if ( dist == 0 ) [[unlikely]]
-          return;
+          return iter;
 
         if ( dist > 0 ) {
           if ( iter.block_->occupied < dist ) {
