@@ -303,7 +303,7 @@ int main()
                 | std::views::take( 500 ) | std::ranges::to<nest::Hive>();
       std::println( "Capacity after inserting 500 elements is {}", hive.capacity() );
       using std::erase;
-      erase( hive, odd ); // test ADL
+      erase( hive, odd );
       std::println( "Capacity after erasing 250 elements is {}, size is {}", hive.capacity(), hive.size() );
       hive.shrink_to_fit();
       std::println( "Capacity after shrink_to_fit() is {}", hive.capacity() );
@@ -321,7 +321,8 @@ int main()
     hive.insert( count, value + 1 );
     std::println( "After inserting {} elements capacity is {}", hive.size(), hive.capacity() );
 
-    nest::erase( hive, value );
+    using std::erase;
+    erase( hive, value );
     std::println( "After erasing {} elements capacity is {}", count, hive.capacity() );
 
     auto hive2           = hive;
@@ -675,7 +676,8 @@ int main()
     std::cout << "bee->id = " << bee->id << '\n';
 
     // remove all elements with even id
-    nest::erase_if( bees, []( const Honeybee& bee ) { return ( bee.id % 2 ) == 0; } );
+    using std::erase_if;
+    erase_if( bees, []( const Honeybee& bee ) { return ( bee.id % 2 ) == 0; } );
 
     auto iter = bees.get_iterator( bee );
     assert( iter == --bees.end() );
@@ -687,14 +689,16 @@ int main()
     std::iota( cnt.begin(), cnt.end(), '0' );
     std::println( "Initially, cnt = {}", cnt );
 
-    nest::erase( cnt, '3' );
+    using std::erase;
+    using std::erase_if;
+    erase( cnt, '3' );
     std::println( "After erase '3', cnt = {}", cnt );
     assert( std::ranges::equal( cnt,
                                 std::views::iota( 0, 10 )
                                   | std::views::transform( []( int x ) -> char { return '0' + x; } )
                                   | std::views::filter( []( char x ) { return x != '3'; } ) ) );
 
-    auto erased = nest::erase_if( cnt, []( char x ) { return ( x - '0' ) % 2 == 0; } );
+    auto erased = erase_if( cnt, []( char x ) { return ( x - '0' ) % 2 == 0; } );
     std::println( "After erase all even numbers, cnt = {}", cnt );
     std::println( "Erased even numbers: {}", erased );
     assert( std::ranges::equal(
@@ -708,7 +712,7 @@ int main()
       { 4, 8 },
       { 4, 2 }
     };
-    nest::erase( nums, std::complex<double> { 4, 2 } );
+    erase( nums, std::complex<double> { 4, 2 } );
     std::println( "After erase {{4, 2}}, nums = {}", nums );
   }
   {

@@ -382,18 +382,13 @@ namespace nest {
           return std::allocator_traits<Alloc>::allocate( alloc, allocation( scheme ) / sizeof( value_type ) );
         }
         template<typename Alloc>
-        static constexpr void deallocate( Alloc& alloc,
-                                          std::allocator_traits<Alloc>::pointer ptr,
-                                          scheme_type scheme ) noexcept
-        {
-          static_assert( std::is_same_v<value_type, typename std::allocator_traits<Alloc>::value_type> );
-          std::allocator_traits<Alloc>::deallocate( alloc, ptr, allocation( scheme ) / sizeof( value_type ) );
-        }
-        template<typename Alloc>
         static void deallocate( Alloc& alloc, auto ptr, scheme_type scheme ) noexcept
         {
+          static_assert( std::is_same_v<value_type, typename std::allocator_traits<Alloc>::value_type> );
           using Resource = std::allocator_traits<Alloc>::pointer;
-          deallocate( alloc, pointer_cast<Resource>( ptr ), scheme );
+          std::allocator_traits<Alloc>::deallocate( alloc,
+                                                    pointer_cast<Resource>( ptr ),
+                                                    allocation( scheme ) / sizeof( value_type ) );
         }
 
         /// @return std::array Return all the SoA array offsets except for T. The offset of T is always 0.
@@ -419,18 +414,13 @@ namespace nest {
           return std::allocator_traits<Alloc>::allocate( alloc, allocation( count ) / sizeof( value_type ) );
         }
         template<typename Alloc>
-        static constexpr void deallocate( Alloc& alloc,
-                                          std::allocator_traits<Alloc>::pointer ptr,
-                                          size_type count ) noexcept
-        {
-          static_assert( std::is_same_v<value_type, typename std::allocator_traits<Alloc>::value_type> );
-          std::allocator_traits<Alloc>::deallocate( alloc, ptr, allocation( count ) / sizeof( value_type ) );
-        }
-        template<typename Alloc>
         static void deallocate( Alloc& alloc, auto ptr, size_type count ) noexcept
         {
+          static_assert( std::is_same_v<value_type, typename std::allocator_traits<Alloc>::value_type> );
           using Resource = std::allocator_traits<Alloc>::pointer;
-          deallocate( alloc, pointer_cast<Resource>( ptr ), count );
+          std::allocator_traits<Alloc>::deallocate( alloc,
+                                                    pointer_cast<Resource>( ptr ),
+                                                    allocation( count ) / sizeof( value_type ) );
         }
       };
     } // namespace utils
@@ -2076,7 +2066,7 @@ namespace nest {
 
     // Append the linked list `[front, tail]` to the front of `other`,
     // this function will not change the hollow pointer.
-    static constexpr void concat( Chunk& list, Chunk other ) noexcept
+    NEST_FORCEINLINE static constexpr void concat( Chunk& list, Chunk other ) noexcept
     {
       assert( other != nullptr );
       assert( other->prev != nullptr );
@@ -2122,7 +2112,7 @@ namespace nest {
       block->prev_hollow = block->next_hollow = nullptr;
     }
     // Splice two hollow chain.
-    static constexpr void splice_hollow( BiList hollow, Chunk& other ) noexcept
+    NEST_FORCEINLINE static constexpr void splice_hollow( BiList hollow, Chunk& other ) noexcept
     {
       assert( hollow.head != nullptr );
       assert( hollow.tail != nullptr );
@@ -2135,7 +2125,7 @@ namespace nest {
 
     /// @brief Find a block meet the specified `expected` number of bytes.
     /// @param expected The expected size, in bytes.
-    static constexpr Chunk borrow_from( Chunk list, size_type expected ) noexcept
+    NEST_FORCEINLINE static constexpr Chunk borrow_from( Chunk list, size_type expected ) noexcept
     {
       for ( ; list != nullptr; list = list->next ) {
         // we don't borrow the last dummy skipfield
@@ -2675,7 +2665,7 @@ namespace nest {
       return dst;
     }
     template<typename U, bool Const>
-    constexpr U* relocate( U* dest, Iterator<Const>&& src, Skipfield limits )
+    NEST_FORCEINLINE constexpr U* relocate( U* dest, Iterator<Const>&& src, Skipfield limits )
     { return relocate( dest, src, limits ); }
 
     // Transfer the elements on the block pointed to by `src` to the block pointed to by dest.
@@ -2717,7 +2707,8 @@ namespace nest {
         } );
     }
     template<bool Const>
-    constexpr Skipfield transfer( std::derived_from<Filler> auto& dest, Iterator<Const>&& src )
+    NEST_FORCEINLINE constexpr Skipfield transfer( std::derived_from<Filler> auto& dest,
+                                                   Iterator<Const>&& src )
     { return transfer( dest, src ); }
 
     /// @brief Due to the operation sequence, if there is a hollow block, it must be the first block of List.
@@ -3128,7 +3119,7 @@ namespace nest {
         } );
     }
 
-    constexpr void interchange( Hive& other )
+    NEST_FORCEINLINE constexpr void interchange( Hive& other )
     {
       std::ranges::swap( head_, other.head_ );
       std::ranges::swap( vacuum_, other.vacuum_ );
@@ -3139,15 +3130,15 @@ namespace nest {
       std::ranges::swap( min_capacity_, other.min_capacity_ );
     }
 
-    constexpr size_type _erase_if( auto&& pred )
+    friend constexpr size_type erase_if( Hive& hive, auto pred )
     {
-      if ( empty() )
+      if ( hive.empty() )
         return 0;
 
       size_type total_erased     = 0;
       size_type currently_erased = 0;
       iterator first;
-      auto cursor = begin();
+      auto cursor = hive.begin();
       while ( true ) {
         // block-based iteration
         const bool satisfied    = std::invoke( pred, *cursor );
@@ -3168,24 +3159,24 @@ namespace nest {
           const auto no_more_block = !within_block && !cursor.next();
           const auto full          = first.block_->occupied == first.block_->capacity;
           if ( satisfied && !within_block )
-            remove( first );
+            hive.remove( first );
           else if ( satisfied )
-            remove( first, std::next( last ) );
+            hive.remove( first, std::next( last ) );
           else
-            remove( first, last );
+            hive.remove( first, last );
           if ( first.block_->occupied == 0 ) {
             if ( !full )
-              remove_hollow( hollow_, first.block_ );
-            if ( first.block_ != head_ ) {
-              unlink( head_, first.block_ );
-              attach( vacuum_, first.block_ );
+              remove_hollow( hive.hollow_, first.block_ );
+            if ( first.block_ != hive.head_ ) {
+              unlink( hive.head_, first.block_ );
+              attach( hive.vacuum_, first.block_ );
             } else
-              attach( vacuum_, detach( head_ ) );
+              attach( hive.vacuum_, detach( hive.head_ ) );
           } else if ( full ) {
             assert( first.block_->occupied < first.block_->capacity );
-            add_hollow( hollow_, first.block_ );
+            add_hollow( hive.hollow_, first.block_ );
           }
-          occupied_ -= currently_erased;
+          hive.occupied_ -= currently_erased;
           total_erased += currently_erased;
           if ( !within_block && no_more_block )
             break;
@@ -3194,19 +3185,10 @@ namespace nest {
       }
       return total_erased;
     }
-    constexpr size_type _erase( const Tp& value )
+    NEST_FORCEINLINE friend constexpr size_type erase( Hive& hive, const Tp& value )
     {
-      return _erase_if( [&]( const auto& ele ) { return ele == value; } );
+      return erase_if( hive, [&]( const auto& ele ) { return ele == value; } );
     }
-
-    // Since `erase_if` relies on certain friend entities that are only valid within Hive itself
-    // (i.e., internal functions of Iterator), this function cannot be implemented outside the class,
-    // nor can the class's friend be templated (which would lead to ODR violations).
-    // Therefore, it must be implemented as an internal hidden method with external invocation.
-    template<typename U, typename A, typename Pred>
-    friend Hive<U, A>::size_type erase_if( Hive<U, A>&, Pred );
-    template<typename U, typename A>
-    friend Hive<U, A>::size_type erase( Hive<U, A>&, const U& );
   };
 
   template<typename InputIt, typename Alloc = std::allocator<std::iter_value_t<InputIt>>>
@@ -3222,13 +3204,6 @@ namespace nest {
   template<std::ranges::input_range R, typename Alloc = std::allocator<std::ranges::range_value_t<R>>>
   Hive( std::from_range_t, R&&, HiveLimits, Alloc = Alloc() ) -> Hive<std::ranges::range_value_t<R>, Alloc>;
 #endif
-
-  template<typename T, typename Alloc, typename Pred>
-  NEST_FORCEINLINE Hive<T, Alloc>::size_type erase_if( Hive<T, Alloc>& hive, Pred pred )
-  { return hive._erase_if( std::move( pred ) ); }
-  template<typename T, typename Alloc>
-  NEST_FORCEINLINE Hive<T, Alloc>::size_type erase( Hive<T, Alloc>& hive, const T& value )
-  { return hive._erase( value ); }
 } // namespace nest
 
 #endif
