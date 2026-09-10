@@ -382,13 +382,18 @@ namespace nest {
           return std::allocator_traits<Alloc>::allocate( alloc, allocation( scheme ) / sizeof( value_type ) );
         }
         template<typename Alloc>
-        static constexpr void deallocate( Alloc& alloc, auto ptr, scheme_type scheme ) noexcept
+        static constexpr void deallocate( Alloc& alloc,
+                                          std::allocator_traits<Alloc>::pointer ptr,
+                                          scheme_type scheme ) noexcept
         {
           static_assert( std::is_same_v<value_type, typename std::allocator_traits<Alloc>::value_type> );
+          std::allocator_traits<Alloc>::deallocate( alloc, ptr, allocation( scheme ) / sizeof( value_type ) );
+        }
+        template<typename Alloc>
+        static void deallocate( Alloc& alloc, auto ptr, scheme_type scheme ) noexcept
+        {
           using Resource = std::allocator_traits<Alloc>::pointer;
-          std::allocator_traits<Alloc>::deallocate( alloc,
-                                                    pointer_cast<Resource>( ptr ),
-                                                    allocation( scheme ) / sizeof( value_type ) );
+          deallocate( alloc, pointer_cast<Resource>( ptr ), scheme );
         }
 
         /// @return std::array Return all the SoA array offsets except for T. The offset of T is always 0.
@@ -414,13 +419,18 @@ namespace nest {
           return std::allocator_traits<Alloc>::allocate( alloc, allocation( count ) / sizeof( value_type ) );
         }
         template<typename Alloc>
-        static constexpr void deallocate( Alloc& alloc, auto ptr, size_type count ) noexcept
+        static constexpr void deallocate( Alloc& alloc,
+                                          std::allocator_traits<Alloc>::pointer ptr,
+                                          size_type count ) noexcept
         {
           static_assert( std::is_same_v<value_type, typename std::allocator_traits<Alloc>::value_type> );
+          std::allocator_traits<Alloc>::deallocate( alloc, ptr, allocation( count ) / sizeof( value_type ) );
+        }
+        template<typename Alloc>
+        static void deallocate( Alloc& alloc, auto ptr, size_type count ) noexcept
+        {
           using Resource = std::allocator_traits<Alloc>::pointer;
-          std::allocator_traits<Alloc>::deallocate( alloc,
-                                                    pointer_cast<Resource>( ptr ),
-                                                    allocation( count ) / sizeof( value_type ) );
+          deallocate( alloc, pointer_cast<Resource>( ptr ), count );
         }
       };
     } // namespace utils
@@ -2275,7 +2285,7 @@ namespace nest {
         build_hole( block, pos, length );
     }
 
-    static constexpr Chunk allocate( BlockAlloc& block_alloc, AreaAlloc& area_alloc, size_type cap )
+    static Chunk allocate( BlockAlloc& block_alloc, AreaAlloc& area_alloc, size_type cap )
     {
       const typename Layout::scheme_type scheme { cap, cap + 1u };
       // Since the Entry contains a Index type aligned with the Skipfield,
@@ -2300,7 +2310,7 @@ namespace nest {
           // In such cases, the only viable way to perform the pointer conversion is via the pointer_traits::pointer_to function,
           // which expects a reference to Tp (Tp&) rather than a pointer to Tp (Tp*).
 
-          // According to the type lifetime rules, we cannot dereference this pointer without an existing valid Tp object.
+          // According to the object lifetime rules, we cannot dereference this pointer without an existing valid Tp object.
           // However, since Entry's default constructor initializes the trivial Index object as the active member,
           // and the union destructor does nothing, we can actually directly default-construct an Entry object,
           // making the above type conversion operation valid; the same applies to Skipfield.
@@ -2333,7 +2343,7 @@ namespace nest {
         },
         [&] { Layout::deallocate( area_alloc, element, cap ); } );
     }
-    static constexpr void deallocate( BlockAlloc& block_alloc, AreaAlloc& area_alloc, Chunk block ) noexcept
+    static void deallocate( BlockAlloc& block_alloc, AreaAlloc& area_alloc, Chunk block ) noexcept
     {
       Layout::deallocate( area_alloc, block->element, { block->capacity, block->capacity + 1u } );
       std::allocator_traits<BlockAlloc>::destroy( block_alloc, std::to_address( block ) );
